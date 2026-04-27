@@ -40,6 +40,7 @@ class DatasetConfig:
         default_factory=lambda: {
             'aloha_sim': ['head_cam', 'left_cam', 'right_cam'],
             'aloha': ['cam_high', 'cam_left_wrist', 'cam_right_wrist'],
+            'arx': ['cam_high', 'cam_left_wrist'],
         },
         init=False,
         repr=False,
@@ -78,6 +79,15 @@ class DatasetConfig:
                 'left_wrist_angle',
                 'left_wrist_rotate',
                 'left_gripper',
+            ],
+            'arx': [
+                'joint_1',
+                'joint_2',
+                'joint_3',
+                'joint_4',
+                'joint_5',
+                'joint_6',
+                'gripper',
             ],
         },
         init=False,
@@ -230,7 +240,22 @@ def create_empty_dataset(
             'shape': (len(motors), ),
             'names': [motors],
         }
-    if has_eepose:
+    if has_eepose and robot_type == 'arx':
+        features['observation.eepose'] = {
+            'dtype':
+            'float32',
+            'shape': (7, ),
+            'names': [[
+                'joint_1',
+                'joint_2',
+                'joint_3',
+                'joint_4',
+                'joint_5',
+                'joint_6',
+                'gripper',
+            ]],
+        }
+    elif has_eepose:
         features['observation.eepose'] = {
             'dtype':
             'float32',

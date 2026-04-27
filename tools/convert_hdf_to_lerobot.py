@@ -39,7 +39,7 @@ def main() -> None:
         '--robot-type',
         type=str,
         default='aloha',
-        choices=['aloha', 'aloha_sim'],
+        choices=['aloha', 'aloha_sim', 'arx'],
         help='Robot type (default: aloha)',
     )
     parser.add_argument(
