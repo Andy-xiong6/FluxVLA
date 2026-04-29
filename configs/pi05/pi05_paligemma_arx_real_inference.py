@@ -1,0 +1,65 @@
+_base_ = ['./pi05_paligemma_ur3_full_finetune.py']
+
+inference = dict(
+    type='ARXInferenceRunner',
+    seed=7,
+    camera_names=['cam_high', 'cam_left_wrist'],
+    arm_action_dim=6,
+    joint_indices=[0, 1, 2, 3, 4, 5],
+    action_chunk=50,
+    joint_command_mode='servoj',
+    prepare_pose=None,
+    prepare_gripper=None,
+    task_descriptions={
+        '1': 'pick up the target object',
+        '2': 'place the target object into the container',
+    },
+    dataset=dict(
+        type='PrivateInferenceDataset',
+        img_keys=['cam_high', 'cam_left_wrist'],
+        transforms=[
+            dict(
+                type='NormalizeStatesAndActions',
+                state_dim=32,
+                state_key='proprio',
+                action_key='action',
+                norm_type='min_max'),
+            dict(type='PreparePromptWithState'),
+            dict(
+                type='ProcessPrompts',
+                tokenizer=dict(
+                    type='PretrainedTokenizer',
+                    model_path='checkpoints/pi05_base',
+                )),
+            dict(type='ResizeImages', height=224, width=224),
+            dict(type='SimpleNormalizeImages'),
+        ]),
+    denormalize_action=dict(
+        type='DenormalizePrivateAction',
+        norm_type='min_max',
+        action_dim=7,
+    ),
+    operator=dict(
+        type='ARXROSOperator',
+        img_wrist_topic='/right_camera',
+        img_third_topic='/mid_camera',
+        joint_state_topic='/joint_information',
+        gripper_state_topic='/joint_information',
+        ee_pose_topic='/follow1_pos_back',
+        joint_command_topic='/joint_control',
+        gripper_command_topic='/joint_control',
+        pose_command_topic=None,
+        joint_state_msg_type='arm_control.msg:JointInformation',
+        gripper_state_msg_type='arm_control.msg:JointInformation',
+        ee_pose_msg_type='arm_control.msg:PosCmd',
+        joint_command_msg_type='arm_control.msg:JointControl',
+        gripper_command_msg_type='arm_control.msg:JointControl',
+        joint_state_field='joint_pos',
+        gripper_state_field='joint_pos[6]',
+        joint_command_field='joint_pos',
+        gripper_command_field='joint_pos[6]',
+        combine_joint_gripper_command=True,
+        gripper_command_index=6,
+        joint_command_length=7,
+        joint_names=[],
+        use_depth_image=False))
