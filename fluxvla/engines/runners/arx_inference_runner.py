@@ -26,6 +26,8 @@ class ARXInferenceRunner(BaseInferenceRunner):
 
     The implementation intentionally mirrors the UR real-robot path so that
     `scripts/inference_real_robot.py` can keep using the shared base loop.
+    The default topics and message types below are aligned with the
+    `ARX_Remote_Control/follow1` deployment scripts.
 
     Quick usage:
         1. Set `type='ARXInferenceRunner'` in your inference config.
@@ -41,9 +43,9 @@ class ARXInferenceRunner(BaseInferenceRunner):
         - wrist RGB topic
         - third-person RGB topic
         - joint state topic
-        - gripper state topic
+        - gripper source field or topic
         - optional EE pose topic
-        - joint and gripper command topics
+        - joint control topic
         - ROS message types / nested field paths
         - `joint_indices` ordering relative to training
     """
@@ -78,34 +80,44 @@ class ARXInferenceRunner(BaseInferenceRunner):
             # -----------------------------------------------------------------
             kwargs['operator'] = {
                 'type': 'ARXROSOperator',
-                # TODO(arx): Replace with the real wrist RGB topic on ARX X5.
-                'img_wrist_topic': '/arx/camera/wrist/color/image_raw',
-                # TODO(arx): Replace with the real third-person RGB topic.
-                'img_third_topic': '/arx/camera/third/color/image_raw',
-                # TODO(arx): Replace with the real arm joint state topic.
-                'joint_state_topic': '/arx/joint_states',
-                # TODO(arx): Replace with the real gripper state topic.
-                'gripper_state_topic': '/arx/gripper/state',
-                # TODO(arx): Set to the real EE pose topic, or None if absent.
-                'ee_pose_topic': '/arx/ee_pose',
-                # TODO(arx): Replace with the real joint command topic.
-                'joint_command_topic': '/arx/command/joint',
-                # TODO(arx): Replace with the real gripper command topic.
-                'gripper_command_topic': '/arx/command/gripper',
-                # TODO(arx): Keep for future pose control; replace if used.
-                'pose_command_topic': '/arx/command/pose',
-                # TODO(arx): Adjust these if ARX uses custom ROS message types.
-                'joint_state_msg_type': 'sensor_msgs.msg:JointState',
-                'gripper_state_msg_type': 'std_msgs.msg:Float32',
-                'joint_command_msg_type': 'sensor_msgs.msg:JointState',
-                'gripper_command_msg_type': 'std_msgs.msg:Float32',
-                # TODO(arx): Adjust field paths if values are wrapped.
-                'joint_state_field': 'position',
-                'gripper_state_field': 'data',
-                'joint_command_field': 'position',
-                'gripper_command_field': 'data',
-                # TODO(arx): Fill joint names if the downstream controller
-                # requires named JointState commands.
+                # TODO(arx): Confirm wrist camera topic if deployment changes.
+                'img_wrist_topic': '/right_camera',
+                # TODO(arx): Confirm third-person camera topic if deployment
+                # changes.
+                'img_third_topic': '/mid_camera',
+                # TODO(arx): Confirm the follow arm state topic if deployment
+                # changes.
+                'joint_state_topic': '/joint_information',
+                # TODO(arx): Gripper is currently read from the same
+                # JointInformation message at `joint_pos[6]`.
+                'gripper_state_topic': '/joint_information',
+                # TODO(arx): Set to None if follow1_pos_back is not available.
+                'ee_pose_topic': '/follow1_pos_back',
+                # TODO(arx): Confirm the control topic if deployment changes.
+                'joint_command_topic': '/joint_control',
+                # TODO(arx): ARX follow1 publishes arm+gripper together on the
+                # same JointControl topic.
+                'gripper_command_topic': '/joint_control',
+                # TODO(arx): Pose control is reserved for future work.
+                'pose_command_topic': None,
+                # TODO(arx): These defaults match follow1 custom ROS messages.
+                'joint_state_msg_type': 'arm_control.msg:JointInformation',
+                'gripper_state_msg_type': 'arm_control.msg:JointInformation',
+                'ee_pose_msg_type': 'arm_control.msg:PosCmd',
+                'joint_command_msg_type': 'arm_control.msg:JointControl',
+                'gripper_command_msg_type': 'arm_control.msg:JointControl',
+                # TODO(arx): Adjust field paths only if message definitions
+                # change in your deployed workspace.
+                'joint_state_field': 'joint_pos',
+                'gripper_state_field': 'joint_pos[6]',
+                'joint_command_field': 'joint_pos',
+                'gripper_command_field': 'joint_pos[6]',
+                # TODO(arx): follow1 uses a fixed 7D joint_pos array.
+                'combine_joint_gripper_command': True,
+                'gripper_command_index': 6,
+                'joint_command_length': 7,
+                # TODO(arx): Fill joint names only if a renamed controller is
+                # introduced later.
                 'joint_names': [],
                 'use_depth_image': False,
             }
@@ -138,8 +150,8 @@ class ARXInferenceRunner(BaseInferenceRunner):
         #   - 'servoj' for servo-style joint streaming
         #   - 'movej'  for discrete joint moves
         # ---------------------------------------------------------------------
-        # TODO(arx): Update this mapping to match the joint order used during
-        # training if ROS JointState.position is ordered differently on ARX.
+        # TODO(arx): Update this mapping if the trained joint order differs
+        # from JointInformation.joint_pos[:6] on your follow1 deployment.
         self.joint_indices = joint_indices
         # TODO(arx): Optionally set a real prepare pose for task reset.
         self.prepare_pose = prepare_pose
@@ -242,7 +254,15 @@ class ARXInferenceRunner(BaseInferenceRunner):
     def _execute_actions(self, actions: np.ndarray, rate):
         joint_cmd = getattr(self.ros_operator, self.joint_command_mode)
         for action in actions:
-            joint_cmd(action[:self.arm_action_dim])
-            if action.shape[0] > self.arm_action_dim:
+            if (getattr(self.ros_operator, 'combine_joint_gripper_command',
+                        False) and action.shape[0] > self.arm_action_dim):
+                self.ros_operator.command_joints_and_gripper(
+                    joint_positions=action[:self.arm_action_dim],
+                    gripper_position=action[self.arm_action_dim])
+            else:
+                joint_cmd(action[:self.arm_action_dim])
+            if (not getattr(self.ros_operator, 'combine_joint_gripper_command',
+                            False)
+                    and action.shape[0] > self.arm_action_dim):
                 self.ros_operator.movegrip(action[self.arm_action_dim])
             rate.sleep()

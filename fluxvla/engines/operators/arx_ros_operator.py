@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import re
 import time
 from collections import deque
 from copy import deepcopy
@@ -44,6 +45,16 @@ def _set_nested_attr(obj: Any, attr_path: str, value: Any):
     attrs = attr_path.split('.')
     for attr in attrs[:-1]:
         target = getattr(target, attr)
+    match = re.fullmatch(r'([A-Za-z_]\w*)\[(\d+)\]', attrs[-1])
+    if match:
+        attr_name, index = match.group(1), int(match.group(2))
+        container = list(getattr(target, attr_name))
+        if index >= len(container):
+            raise IndexError(
+                f'Index {index} out of bounds for attribute {attr_name!r}')
+        container[index] = value
+        setattr(target, attr_name, container)
+        return
     setattr(target, attrs[-1], value)
 
 
@@ -51,6 +62,16 @@ def _get_nested_attr(obj: Any, attr_path: str, default: Any = None):
     """Read a nested attribute using dot notation."""
     target = obj
     for attr in attr_path.split('.'):
+        match = re.fullmatch(r'([A-Za-z_]\w*)\[(\d+)\]', attr)
+        if match:
+            attr_name, index = match.group(1), int(match.group(2))
+            if not hasattr(target, attr_name):
+                return default
+            target = getattr(target, attr_name)
+            if index >= len(target):
+                return default
+            target = target[index]
+            continue
         if not hasattr(target, attr):
             return default
         target = getattr(target, attr)
@@ -90,6 +111,9 @@ class ARXROSOperator:
                  joint_command_field='position',
                  gripper_command_field='data',
                  pose_command_frame_id='base_link',
+                 combine_joint_gripper_command=False,
+                 gripper_command_index=None,
+                 joint_command_length=None,
                  joint_names=None,
                  queue_size=1000):
         self.img_wrist_topic = img_wrist_topic
@@ -108,6 +132,9 @@ class ARXROSOperator:
         self.joint_command_field = joint_command_field
         self.gripper_command_field = gripper_command_field
         self.pose_command_frame_id = pose_command_frame_id
+        self.combine_joint_gripper_command = combine_joint_gripper_command
+        self.gripper_command_index = gripper_command_index
+        self.joint_command_length = joint_command_length
         self.joint_names = joint_names or []
         self.queue_size = queue_size
 
@@ -147,6 +174,7 @@ class ARXROSOperator:
         self.depth_third = 0
         self.last_time_step = 0
         self.bridge = CvBridge()
+        self.last_joint_command = None
 
         self.img_wrist_deque = deque()
         self.img_third_deque = deque()
@@ -446,6 +474,9 @@ class ARXROSOperator:
             }
 
     def movej(self, qpos):
+        if self.combine_joint_gripper_command:
+            self.command_joints_and_gripper(qpos, publish=True)
+            return
         msg = self.joint_command_msg_cls()
         if hasattr(msg, 'name') and self.joint_names:
             msg.name = list(self.joint_names)
@@ -456,6 +487,12 @@ class ARXROSOperator:
         self.movej(qpos)
 
     def movegrip(self, gripper_position):
+        if self.combine_joint_gripper_command:
+            self.command_joints_and_gripper(
+                joint_positions=None,
+                gripper_position=gripper_position,
+                publish=True)
+            return
         msg = self.gripper_command_msg_cls()
         value = deepcopy(gripper_position)
         if isinstance(value, (list, tuple)) and len(value) == 1:
@@ -499,6 +536,87 @@ class ARXROSOperator:
 
     def movep(self, eepose, frame_id: Optional[str] = None):
         self.servop(eepose, frame_id=frame_id)
+
+    def _coerce_gripper_scalar(self, value):
+        value = deepcopy(value)
+        if isinstance(value, np.ndarray):
+            if value.size != 1:
+                raise ValueError(
+                    'Gripper command array must contain exactly one value')
+            return float(value.reshape(-1)[0])
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                raise ValueError(
+                    'Gripper command sequence must contain exactly one value')
+            return value[0]
+        return value
+
+    def _infer_joint_command_length(self, joint_positions):
+        if self.joint_command_length is not None:
+            return self.joint_command_length
+        current = self.last_joint_command
+        if current is None and len(self.joint_state_deque) > 0:
+            current = self.get_joint_positions(self.joint_state_deque[-1])
+        if current is not None:
+            return len(current)
+        if self.gripper_command_index is not None:
+            return max(len(joint_positions), self.gripper_command_index + 1)
+        return len(joint_positions)
+
+    def command_joints_and_gripper(self,
+                                   joint_positions=None,
+                                   gripper_position=None,
+                                   publish=True):
+        if joint_positions is None and gripper_position is None:
+            raise ValueError('At least one of joint_positions or '
+                             'gripper_position must be provided')
+
+        if joint_positions is not None:
+            joint_positions = list(joint_positions)
+
+        current = self.last_joint_command
+        if current is None and len(self.joint_state_deque) > 0:
+            current = list(self.get_joint_positions(self.joint_state_deque[-1]))
+
+        target_length = self._infer_joint_command_length(
+            joint_positions if joint_positions is not None else [])
+        if current is None:
+            full_command = [0.0] * target_length
+        else:
+            full_command = list(current)
+            if len(full_command) < target_length:
+                full_command.extend([0.0] * (target_length - len(full_command)))
+
+        if joint_positions is not None:
+            full_command[:len(joint_positions)] = joint_positions
+
+        if gripper_position is not None:
+            gripper_value = self._coerce_gripper_scalar(gripper_position)
+            if self.gripper_command_index is None:
+                if len(full_command) == 0:
+                    full_command = [gripper_value]
+                elif joint_positions is not None and len(full_command) > len(
+                        joint_positions):
+                    full_command[len(joint_positions)] = gripper_value
+                else:
+                    full_command[-1] = gripper_value
+            else:
+                if self.gripper_command_index >= len(full_command):
+                    full_command.extend([0.0] *
+                                        (self.gripper_command_index + 1 -
+                                         len(full_command)))
+                full_command[self.gripper_command_index] = gripper_value
+
+        self.last_joint_command = list(full_command)
+
+        if publish:
+            msg = self.joint_command_msg_cls()
+            if hasattr(msg, 'name') and self.joint_names:
+                msg.name = list(self.joint_names)
+            _set_nested_attr(msg, self.joint_command_field, full_command)
+            self.joint_command_pub.publish(msg)
+
+        return full_command
 
     def get_joint_positions(self, joint_state_msg):
         values = _get_nested_attr(joint_state_msg, self.joint_state_field)
