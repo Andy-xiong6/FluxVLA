@@ -56,6 +56,10 @@ class ARXInferenceRunner(BaseInferenceRunner):
                  prepare_pose: Optional[List[float]] = None,
                  prepare_gripper: Optional[float] = None,
                  joint_command_mode: str = 'servoj',
+                 binarize_gripper: bool = False,
+                 gripper_threshold: float = 0.5,
+                 gripper_open_value: float = 1.0,
+                 gripper_close_value: float = 0.0,
                  dry_run: bool = False,
                  preview_action_count: int = 5,
                  *args,
@@ -162,6 +166,10 @@ class ARXInferenceRunner(BaseInferenceRunner):
         # TODO(arx): Switch to 'movej' if the ARX controller expects
         # non-servo joint commands during inference.
         self.joint_command_mode = joint_command_mode
+        self.binarize_gripper = binarize_gripper
+        self.gripper_threshold = gripper_threshold
+        self.gripper_open_value = gripper_open_value
+        self.gripper_close_value = gripper_close_value
         self.dry_run = dry_run
         self.preview_action_count = preview_action_count
 
@@ -254,6 +262,17 @@ class ARXInferenceRunner(BaseInferenceRunner):
                     self.ros_operator.movep(ee_pose)
                 if gripper_position is not None:
                     self.ros_operator.movegrip(gripper_position)
+
+    def _postprocess_actions(self, raw_action):
+        actions = super()._postprocess_actions(raw_action)
+        if self.binarize_gripper and actions.shape[1] > self.arm_action_dim:
+            gripper_idx = self.arm_action_dim
+            actions[:, gripper_idx] = np.where(
+                actions[:, gripper_idx] > self.gripper_threshold,
+                self.gripper_open_value,
+                self.gripper_close_value,
+            )
+        return actions
 
     def _execute_actions(self, actions: np.ndarray, rate):
         if self.disable_puppet_arm or self.dry_run:
