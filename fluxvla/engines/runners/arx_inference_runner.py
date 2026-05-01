@@ -56,6 +56,8 @@ class ARXInferenceRunner(BaseInferenceRunner):
                  prepare_pose: Optional[List[float]] = None,
                  prepare_gripper: Optional[float] = None,
                  joint_command_mode: str = 'servoj',
+                 dry_run: bool = False,
+                 preview_action_count: int = 5,
                  *args,
                  **kwargs):
         if 'camera_names' not in kwargs or kwargs['camera_names'] is None:
@@ -160,6 +162,8 @@ class ARXInferenceRunner(BaseInferenceRunner):
         # TODO(arx): Switch to 'movej' if the ARX controller expects
         # non-servo joint commands during inference.
         self.joint_command_mode = joint_command_mode
+        self.dry_run = dry_run
+        self.preview_action_count = preview_action_count
 
     def get_ros_observation(
         self
@@ -252,6 +256,15 @@ class ARXInferenceRunner(BaseInferenceRunner):
                     self.ros_operator.movegrip(gripper_position)
 
     def _execute_actions(self, actions: np.ndarray, rate):
+        if self.disable_puppet_arm or self.dry_run:
+            preview_count = min(len(actions), self.preview_action_count)
+            print('\n[ARXInferenceRunner] Dry run enabled, actions not sent.')
+            print(f'[ARXInferenceRunner] action chunk shape: {actions.shape}')
+            for idx in range(preview_count):
+                print(f'[ARXInferenceRunner] action[{idx}]: '
+                      f'{actions[idx].tolist()}')
+            return
+
         joint_cmd = getattr(self.ros_operator, self.joint_command_mode)
         for action in actions:
             if (getattr(self.ros_operator, 'combine_joint_gripper_command',
