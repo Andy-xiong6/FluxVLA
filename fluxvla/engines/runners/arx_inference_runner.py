@@ -12,12 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 
 from ..utils.root import RUNNERS
 from .base_inference_runner import BaseInferenceRunner
+
+
+def resample_remaining(traj, offset):
+    """Linearly interpolate remaining trajectory from a fractional offset."""
+    N = traj.shape[0]
+    M = N - int(offset)
+    if M <= 0:
+        return traj[:0]
+    idx = np.clip(offset + np.arange(M), 0.0, N - 1.0)
+    lo = np.floor(idx).astype(int)
+    hi = np.minimum(lo + 1, N - 1)
+    alpha = (idx - lo)[:, np.newaxis]
+    return traj[lo] + alpha * (traj[hi] - traj[lo])
 
 
 @RUNNERS.register_module()
@@ -60,6 +75,9 @@ class ARXInferenceRunner(BaseInferenceRunner):
                  gripper_threshold: float = 0.5,
                  gripper_open_value: float = 1.0,
                  gripper_close_value: float = 0.0,
+                 async_execution: bool = False,
+                 execute_horizon: int = None,
+                 rtc_config: dict = None,
                  dry_run: bool = False,
                  preview_action_count: int = 5,
                  *args,
@@ -170,6 +188,10 @@ class ARXInferenceRunner(BaseInferenceRunner):
         self.gripper_threshold = gripper_threshold
         self.gripper_open_value = gripper_open_value
         self.gripper_close_value = gripper_close_value
+        self.async_execution = async_execution
+        self.execute_horizon = execute_horizon
+        self.rtc_config = rtc_config
+        self.dt = 1.0 / self.publish_rate
         self.dry_run = dry_run
         self.preview_action_count = preview_action_count
 
@@ -263,6 +285,39 @@ class ARXInferenceRunner(BaseInferenceRunner):
                 if gripper_position is not None:
                     self.ros_operator.movegrip(gripper_position)
 
+    def _predict_action(self, inputs):
+        prev = self._prev_ctx
+        ctx = self._action_ctx
+
+        ctx.inference_start = time.time()
+
+        if (not self._use_remote and prev is not None
+                and hasattr(prev, 'raw_actions') and self.rtc_config
+                and self.rtc_config.get('enabled', False)):
+            offset = (ctx.inference_start - prev.action_timestamp) / self.dt
+            remaining = resample_remaining(prev.raw_actions[0], offset)[None]
+            prefix_len = self.rtc_config.get('prefix_len')
+            if prefix_len is None:
+                prefix_len = int(
+                    getattr(prev, 'inference_elapsed', 0.0) *
+                    self.publish_rate)
+            prefix_len = min(prefix_len, remaining.shape[1])
+            if prefix_len > 0:
+                inputs['prev_actions'] = torch.from_numpy(remaining).to(
+                    device=inputs['states'].device,
+                    dtype=inputs['states'].dtype)
+                inputs['prefix_len'] = prefix_len
+                inputs['rtc_config'] = self.rtc_config
+
+        if self._use_remote:
+            raw_action = self._predict_action_remote(inputs)
+        else:
+            raw_action = self.vla.predict_action(**inputs)
+
+        ctx.inference_elapsed = time.time() - ctx.inference_start
+        ctx.raw_actions = raw_action.cpu().numpy()
+        return raw_action
+
     def _postprocess_actions(self, raw_action):
         actions = super()._postprocess_actions(raw_action)
         if self.binarize_gripper and actions.shape[1] > self.arm_action_dim:
@@ -275,6 +330,17 @@ class ARXInferenceRunner(BaseInferenceRunner):
         return actions
 
     def _execute_actions(self, actions: np.ndarray, rate):
+        ctx = self._action_ctx
+
+        if self.async_execution and self._prev_ctx is not None:
+            ctx.action_timestamp = ctx.inference_start
+            offset = (time.time() - ctx.action_timestamp) / self.dt
+            actions = resample_remaining(actions, offset)
+        else:
+            ctx.action_timestamp = time.time()
+            if self.execute_horizon is not None:
+                actions = actions[:self.execute_horizon]
+
         if self.disable_puppet_arm or self.dry_run:
             preview_count = min(len(actions), self.preview_action_count)
             print('\n[ARXInferenceRunner] Dry run enabled, actions not sent.')
@@ -284,17 +350,40 @@ class ARXInferenceRunner(BaseInferenceRunner):
                       f'{actions[idx].tolist()}')
             return
 
-        joint_cmd = getattr(self.ros_operator, self.joint_command_mode)
-        for action in actions:
-            if (getattr(self.ros_operator, 'combine_joint_gripper_command',
-                        False) and action.shape[0] > self.arm_action_dim):
-                self.ros_operator.command_joints_and_gripper(
-                    joint_positions=action[:self.arm_action_dim],
-                    gripper_position=action[self.arm_action_dim])
-            else:
-                joint_cmd(action[:self.arm_action_dim])
-            if (not getattr(self.ros_operator, 'combine_joint_gripper_command',
-                            False)
-                    and action.shape[0] > self.arm_action_dim):
-                self.ros_operator.movegrip(action[self.arm_action_dim])
-            rate.sleep()
+        if len(actions) == 0:
+            return
+
+        gripper_actions = None
+        if actions.shape[1] > self.arm_action_dim:
+            gripper_actions = actions[:, self.arm_action_dim]
+
+        if hasattr(self.ros_operator, 'execute_trajectory'):
+            self.ros_operator.execute_trajectory(
+                joint_trajectory=actions[:, :self.arm_action_dim],
+                dt=self.dt,
+                async_exec=self.async_execution,
+                gripper_trajectory=gripper_actions,
+                joint_command_mode=self.joint_command_mode)
+        else:
+            joint_cmd = getattr(self.ros_operator, self.joint_command_mode)
+            for action in actions:
+                if (getattr(self.ros_operator, 'combine_joint_gripper_command',
+                            False) and action.shape[0] > self.arm_action_dim):
+                    self.ros_operator.command_joints_and_gripper(
+                        joint_positions=action[:self.arm_action_dim],
+                        gripper_position=action[self.arm_action_dim])
+                else:
+                    joint_cmd(action[:self.arm_action_dim])
+                if (not getattr(self.ros_operator,
+                                'combine_joint_gripper_command', False)
+                        and action.shape[0] > self.arm_action_dim):
+                    self.ros_operator.movegrip(action[self.arm_action_dim])
+                rate.sleep()
+
+        if self.async_execution and self.execute_horizon is not None:
+            time.sleep(self.execute_horizon * self.dt)
+
+    def cleanup(self):
+        if hasattr(self.ros_operator, 'stop_trajectory'):
+            self.ros_operator.stop_trajectory()
+        super().cleanup()

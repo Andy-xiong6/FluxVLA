@@ -14,6 +14,7 @@
 
 import importlib
 import re
+import threading
 import time
 from collections import deque
 from copy import deepcopy
@@ -183,6 +184,8 @@ class ARXROSOperator:
         self.joint_state_deque = deque()
         self.gripper_state_deque = deque()
         self.ee_pose_deque = deque()
+        self._traj_thread = None
+        self._traj_stop_event = threading.Event()
 
     def get_frame(self, slop=0.7):
         """Get synchronized frame data from all configured sensors."""
@@ -617,6 +620,71 @@ class ARXROSOperator:
             self.joint_command_pub.publish(msg)
 
         return full_command
+
+    def execute_trajectory(self,
+                           joint_trajectory,
+                           dt=0.1,
+                           async_exec=False,
+                           gripper_trajectory=None,
+                           joint_command_mode='servoj'):
+        joint_traj = np.asarray(joint_trajectory)
+        if joint_traj.ndim != 2:
+            raise ValueError('joint_trajectory must be a 2D array')
+
+        grip_traj = None
+        if gripper_trajectory is not None:
+            grip_traj = np.asarray(gripper_trajectory).reshape(-1)
+            if len(grip_traj) != len(joint_traj):
+                raise ValueError('gripper_trajectory length must match '
+                                 'joint_trajectory length')
+
+        self._traj_stop_event.set()
+        self._traj_stop_event = threading.Event()
+        stop_event = self._traj_stop_event
+
+        if async_exec:
+            self._traj_thread = threading.Thread(
+                target=self._run_trajectory,
+                args=(joint_traj, dt, stop_event, grip_traj,
+                      joint_command_mode),
+                daemon=True)
+            self._traj_thread.start()
+        else:
+            self._run_trajectory(joint_traj, dt, stop_event, grip_traj,
+                                 joint_command_mode)
+
+    def stop_trajectory(self):
+        self._traj_stop_event.set()
+
+    def is_trajectory_running(self):
+        return (self._traj_thread is not None and self._traj_thread.is_alive())
+
+    def _run_trajectory(self,
+                        joint_traj,
+                        dt,
+                        stop_event,
+                        gripper_traj=None,
+                        joint_command_mode='servoj'):
+        import rospy
+
+        joint_cmd = getattr(self, joint_command_mode)
+        rate = rospy.Rate(1.0 / dt)
+
+        for idx in range(len(joint_traj)):
+            if rospy.is_shutdown() or stop_event.is_set():
+                break
+
+            if self.combine_joint_gripper_command and gripper_traj is not None:
+                self.command_joints_and_gripper(
+                    joint_positions=joint_traj[idx].tolist(),
+                    gripper_position=gripper_traj[idx],
+                    publish=True)
+            else:
+                joint_cmd(joint_traj[idx].tolist())
+                if gripper_traj is not None:
+                    self.movegrip(gripper_traj[idx])
+
+            rate.sleep()
 
     def get_joint_positions(self, joint_state_msg):
         values = _get_nested_attr(joint_state_msg, self.joint_state_field)
