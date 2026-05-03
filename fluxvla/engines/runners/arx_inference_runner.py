@@ -72,7 +72,8 @@ class ARXInferenceRunner(BaseInferenceRunner):
                  prepare_gripper: Optional[float] = None,
                  joint_command_mode: str = 'servoj',
                  binarize_gripper: bool = False,
-                 gripper_threshold: float = 0.5,
+                 open_threshold: float = 0.5,
+                 close_threshold: float = 0.5,
                  gripper_open_value: float = 1.0,
                  gripper_close_value: float = 0.0,
                  async_execution: bool = False,
@@ -82,6 +83,10 @@ class ARXInferenceRunner(BaseInferenceRunner):
                  preview_action_count: int = 5,
                  *args,
                  **kwargs):
+        legacy_gripper_thr = kwargs.pop('gripper_threshold', None)
+        if legacy_gripper_thr is not None:
+            open_threshold = legacy_gripper_thr
+            close_threshold = legacy_gripper_thr
         if 'camera_names' not in kwargs or kwargs['camera_names'] is None:
             kwargs['camera_names'] = ['cam_high', 'cam_left_wrist']
 
@@ -185,9 +190,12 @@ class ARXInferenceRunner(BaseInferenceRunner):
         # non-servo joint commands during inference.
         self.joint_command_mode = joint_command_mode
         self.binarize_gripper = binarize_gripper
-        self.gripper_threshold = gripper_threshold
+        self.open_threshold = open_threshold
+        self.close_threshold = close_threshold
         self.gripper_open_value = gripper_open_value
         self.gripper_close_value = gripper_close_value
+        # Persisted across chunks when open_threshold != close_threshold (hysteresis).
+        self._gripper_binarize_state_open: Optional[bool] = None
         self.async_execution = async_execution
         self.execute_horizon = execute_horizon
         self.rtc_config = rtc_config
@@ -322,11 +330,34 @@ class ARXInferenceRunner(BaseInferenceRunner):
         actions = super()._postprocess_actions(raw_action)
         if self.binarize_gripper and actions.shape[1] > self.arm_action_dim:
             gripper_idx = self.arm_action_dim
-            actions[:, gripper_idx] = np.where(
-                actions[:, gripper_idx] > self.gripper_threshold,
-                self.gripper_open_value,
-                self.gripper_close_value,
-            )
+            g = np.asarray(actions[:, gripper_idx], dtype=np.float64)
+            if np.isclose(self.open_threshold, self.close_threshold):
+                thr = float(self.open_threshold)
+                actions[:, gripper_idx] = np.where(
+                    g > thr,
+                    self.gripper_open_value,
+                    self.gripper_close_value,
+                )
+            else:
+                n = g.shape[0]
+                out = np.empty(n, dtype=actions.dtype)
+                is_open = self._gripper_binarize_state_open
+                if is_open is None:
+                    is_open = False
+                ot, ct = float(self.open_threshold), float(self.close_threshold)
+                open_v = self.gripper_open_value
+                close_v = self.gripper_close_value
+                for t in range(n):
+                    v = float(g[t])
+                    if is_open:
+                        if v < ct:
+                            is_open = False
+                    else:
+                        if v > ot:
+                            is_open = True
+                    out[t] = open_v if is_open else close_v
+                self._gripper_binarize_state_open = is_open
+                actions[:, gripper_idx] = out
         return actions
 
     def _execute_actions(self, actions: np.ndarray, rate):
