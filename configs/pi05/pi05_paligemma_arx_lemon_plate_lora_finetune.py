@@ -14,12 +14,12 @@
 
 model = dict(
     type='PI05FlowMatching',
-    rtc_training_config=dict(
-        enabled=True,
-        max_delay=7,
-        distribution='exponential',  # 'exponential' (recommended) or 'uniform'
-        temperature=1.0,  # only used for 'exponential'; larger = flatter
-    ),
+    # rtc_training_config=dict(
+    #     enabled=True,
+    #     max_delay=7,
+    #     distribution='exponential',  # 'exponential' (recommended) or 'uniform'
+    #     temperature=1.0,  # only used for 'exponential'; larger = flatter
+    # ),
     llm_backbone=dict(
         type='ConditionGemmaModel',
         adarms_cond_dim=None,
@@ -168,7 +168,7 @@ train_dataloader = dict(
                 type='ParquetDataset',
                 data_root_path=  # noqa: E251
                 [
-                    './datasets/arx_lemon_plate_lerobot/arx_lemon_plate',
+                    './datasets/arx_lemon_plate_lerobotv2.1/lemon_plate',
                 ],
                 transforms=[
                     dict(
@@ -244,22 +244,35 @@ runner = dict(
 
 inference = dict(
     type='ARXInferenceRunner',
+    # async_execution=True,
+    # execute_horizon=10,
+    # rtc_config=dict(
+    #     enabled=True,
+    #     method='guidance',
+    #     prefix_len=5,
+    #     decay_end=10,
+    #     schedule='exp',
+    #     max_guidance_weight=5.0,
+    #     use_vjp=False,
+    # ),
     seed=7,
     camera_names=['cam_high', 'cam_left_wrist'],
     arm_action_dim=6,
     joint_indices=[0, 1, 2, 3, 4, 5],
     joint_command_mode='servoj',
     binarize_gripper=True,
-    gripper_threshold=0.5,
+    open_threshold=3.5,
+    close_threshold=1.6,
     gripper_open_value=5.0,
     gripper_close_value=0.0,
     disable_puppet_arm=True,
     dry_run=True,
     preview_action_count=5,
+    publish_rate=10,
     prepare_pose=None,
     prepare_gripper=None,
     task_descriptions={
-        '1': 'Pick up the yellow lemon and put it in the red plate',
+        '1': 'pick up the yellow lemon and put it on the red plate',
     },
     dataset=dict(
         type='PrivateInferenceDataset',

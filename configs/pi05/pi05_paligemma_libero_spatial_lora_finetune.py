@@ -14,12 +14,6 @@
 
 model = dict(
     type='PI05FlowMatching',
-    rtc_training_config=dict(
-        enabled=True,
-        max_delay=7,
-        distribution='exponential',  # 'exponential' (recommended) or 'uniform'
-        temperature=1.0,  # only used for 'exponential'; larger = flatter
-    ),
     llm_backbone=dict(
         type='ConditionGemmaModel',
         adarms_cond_dim=None,
@@ -71,7 +65,7 @@ model = dict(
         out_dim=2048,
     ),
     proj_width=1024,
-    n_action_steps=50,
+    n_action_steps=10,
     action_in_proj=dict(type='LinearProjector', in_dim=32, out_dim=1024),
     action_out_proj=dict(type='LinearProjector', in_dim=1024, out_dim=32),
     time_mlp_in=dict(type='LinearProjector', in_dim=1024, out_dim=1024),
@@ -120,26 +114,23 @@ model = dict(
         'action_out_proj.projector': 'action_out_proj',
         'llm_backbone.embed_tokens': 'paligemma_with_expert.paligemma.lm_head',
     },
-    params_to_change_dtype=[
-        'llm_expert.llm.model.layers',
-        'vlm_backbone.vlm.model.language_model.layers',
-        'vlm_backbone.vlm.model.vision_tower',
-        'vlm_backbone.vlm.model.multi_modal_projector',
-    ],
-    ori_action_dim=7,
     use_lora=True,
     lora_rank=256,
     lora_alpha=512,
     lora_dropout=0.0,
     lora_target_modules=[
+        # Attention projections (llm_backbone & llm_expert)
         'q_proj',
         'v_proj',
         'k_proj',
         'o_proj',
+        # MLP layers (llm_backbone & llm_expert)
         'gate_proj',
         'up_proj',
         'down_proj',
+        # Vision projector (image -> LLM embedding)
         'projector.projector',
+        # Vision backbone attention (SigLIP)
         'out_proj',
         'fc1',
         'fc2',
@@ -149,70 +140,71 @@ model = dict(
         'action_out_proj',
         'time_mlp_in',
         'time_mlp_out',
-    ],
-)
-
-inference_model = model.copy()
+    ])
 
 train_dataloader = dict(
-    per_device_batch_size=1,
+    per_device_batch_size=8,
     per_device_num_workers=4,
     dataset=dict(
         type='DistributedRepeatingDataset',
-        name_mappings={'observation.state': ['proprio', 'action']},
-        statistic_keys=[
-            'observation.state', 'observation.eepose', 'timestamp'
-        ],
-        datasets=[
-            dict(
-                type='ParquetDataset',
-                data_root_path=  # noqa: E251
-                [
-                    './datasets/arx_lemon_plate_lerobotv2.1/lemon_plate',
-                ],
-                transforms=[
-                    dict(
-                        type='ProcessParquetInputs',
-                        parquet_keys=[
-                            'observation.state', 'timestamp', 'actions',
-                            'info', 'stats', 'action_masks'
-                        ],
-                        video_keys=[
-                            'observation.images.cam_high',
-                            'observation.images.cam_left_wrist'
-                        ],
-                        name_mappings={
-                            'observation.state': ['states'],
-                            'actions': ['actions']
-                        }),
-                    dict(
-                        type='NormalizeStatesAndActions',
-                        action_dim=32,
-                        state_dim=32,
-                        state_key='proprio',
-                        action_key='action',
-                        norm_type='min_max'),
-                    dict(type='PreparePromptWithState'),
-                    dict[str, str | dict[str, str]](
-                        type='ProcessPrompts',
-                        max_len=200,
-                        tokenizer=dict(
-                            type='PretrainedTokenizer',
-                            model_path=  # noqa: E251
-                            'checkpoints/pi05_base',  # noqa: E501
-                            # special_tokens={'pad_token': '<PAD>'}
-                        )),
-                    dict(type='ResizeImages', height=224, width=224),
-                    dict(type='SimpleNormalizeImages'),
-                ],
-                action_window_size=50)
-        ]))
+        name_mappings={
+            'observation.state': ['proprio'],
+            'action': ['action']
+        },
+        statistic_keys=['observation.state', 'timestamp', 'action'],
+        statistic_name='libero_spatial_no_noops',
+        datasets=dict(
+            type='ParquetDataset',
+            data_root_path=  # noqa: E251
+            './datasets/libero_spatial_no_noops_lerobotv2.1',  # noqa: E501
+            transforms=[
+                dict(
+                    type='ProcessParquetInputs',
+                    parquet_keys=[
+                        'observation.state', 'timestamp', 'actions', 'info',
+                        'stats', 'action_masks'
+                    ],
+                    video_keys=[
+                        'observation.images.image',
+                        'observation.images.wrist_image',
+                    ],
+                    name_mappings={
+                        'observation.state': ['states'],
+                        'actions': ['actions']
+                    }),
+                dict(type='ParquetPrompter', use_conversation=False),
+                dict(
+                    type='ProcessPrompts',
+                    tokenizer=dict(type='PaligemmaTokenizer'
+                                   # special_tokens={'pad_token': '<PAD>'}
+                                   )),
+                dict(type='ResizeImages', height=224, width=224),
+                dict(
+                    type='NormalizeImages',
+                    means=[[123.515625, 116.04492188, 103.59375],
+                           [123.515625, 116.04492188, 103.59375]],
+                    stds=[[58.27148438, 57.02636719, 57.27539062],
+                          [58.27148438, 57.02636719, 57.27539062]],
+                ),
+                dict(
+                    type='NormalizeStatesAndActions',
+                    action_dim=32,
+                    state_dim=32,
+                    state_key='proprio',
+                    action_key='action',
+                    norm_type='mean_std')
+            ],
+            action_window_size=10,
+            action_key='action',
+            use_delta=False,
+            statistic_name='libero_spatial_no_noops',
+            window_start_idx=0)))
 
 runner = dict(
     type='DDPTrainRunner',
-    max_epochs=6,
+    max_epochs=24,
     learning_rate=5e-5,
-    weight_decay=0.01,
+    weight_decay=0.0,
     max_grad_norm=1.0,
     sharding_strategy='no-shard',
     collator=dict(
@@ -223,102 +215,65 @@ runner = dict(
         ],
         meta_keys=['task_description', 'prompt', 'info', 'stats']),
     sampler=None,
-    warmup_ratio=0.03,
-    tokenizer=dict(
-        type='PretrainedTokenizer',
-        model_path=  # noqa: E251
-        'checkpoints/pi05_base',
-        # special_tokens={'pad_token': '<PAD>'}
-    ),
+    tokenizer=dict(type='PaligemmaTokenizer'
+                   # special_tokens={'pad_token': '<PAD>'}
+                   ),
     metric=dict(
         type='VLAMetric',
         active_trackers=('jsonl', 'wandb'),
         run_dir='work_dirs',
-        grad_accumulation_steps=8,
+        grad_accumulation_steps=1,
         window_size=1),
     lr_scheduler_type='linear-warmup+cosine-decay',
+    warmup_ratio=0.03,
     enable_gradient_checkpointing=True,
     enable_mixed_precision_training=True,
     mixed_precision_dtype='bf16',
     change_key_name=False)
 
-inference = dict(
-    type='ARXInferenceRunner',
-    async_execution=True,
-    execute_horizon=10,
-    rtc_config=dict(
-        enabled=True,
-        method='prefix',
-        prefix_len=5,
-    ),
+eval = dict(
+    type='LiberoEvalRunner',
+    task_suite_name='libero_spatial',
+    model_family='pi0',
+    eval_chunk_size=10,
+    resize_size=224,
+    num_trials_per_task=50,
+    num_steps_wait=10,
     seed=7,
-    camera_names=['cam_high', 'cam_left_wrist'],
-    arm_action_dim=6,
-    joint_indices=[0, 1, 2, 3, 4, 5],
-    joint_command_mode='servoj',
-    binarize_gripper=True,
-    open_threshold=3.5,
-    close_threshold=1.6,
-    gripper_open_value=5.0,
-    gripper_close_value=0.0,
-    disable_puppet_arm=True,
-    dry_run=True,
-    publish_rate=10,
-    preview_action_count=5,
-    prepare_pose=None,
-    prepare_gripper=None,
-    task_descriptions={
-        '1': 'pick up the yellow lemon and put it on the red plate',
-    },
     dataset=dict(
-        type='PrivateInferenceDataset',
-        img_keys=['cam_high', 'cam_left_wrist'],
+        type='LiberoParquetEvalDataset',
         transforms=[
             dict(
-                type='NormalizeStatesAndActions',
+                type='ProcessLiberoEvalInputs',
+                img_keys=['agentview_image', 'robot0_eye_in_hand_image'],
+            ),
+            dict(
+                type='TransformImage',
+                image_resize_strategy='resize-naive',
+                input_sizes=[[3, 224, 224], [3, 224, 224]],
+                means=[[123.515625, 116.04492188, 103.59375],
+                       [123.515625, 116.04492188, 103.59375]],
+                stds=[[58.27148438, 57.02636719, 57.27539062],
+                      [58.27148438, 57.02636719, 57.27539062]],
+            ),
+            dict(
+                type='LiberoPromptFromInputs',
+                use_conversation=False,
+                tokenizer=dict(type='PaligemmaTokenizer'
+                               # special_tokens={'pad_token': '<PAD>'}
+                               )),
+            dict(
+                type='LiberoProprioFromInputs',
+                norm_type='mean_std',
+                pos_key='robot0_eef_pos',
+                quat_key='robot0_eef_quat',
+                gripper_key='robot0_gripper_qpos',
                 state_dim=32,
-                state_key='proprio',
-                action_key='action',
-                norm_type='min_max'),
-            dict(type='PreparePromptWithState'),
-            dict[str, str | dict[str, str]](
-                type='ProcessPrompts',
-                tokenizer=dict(
-                    type='PretrainedTokenizer',
-                    model_path=  # noqa: E251
-                    'checkpoints/pi05_base',
-                    # special_tokens={'pad_token': '<PAD>'}
-                )),
-            dict(type='ResizeImages', height=224, width=224),
-            dict(type='SimpleNormalizeImages'),
+                out_key='states'),
         ]),
     denormalize_action=dict(
-        type='DenormalizePrivateAction',
-        norm_type='min_max',
+        type='DenormalizeLiberoAction',
+        norm_type='mean_std',
         action_dim=7,
     ),
-    action_chunk=50,
-    operator=dict(
-        type='ARXROSOperator',
-        img_wrist_topic='/right_camera',
-        img_third_topic='/mid_camera',
-        joint_state_topic='/joint_information',
-        gripper_state_topic='/joint_information',
-        ee_pose_topic='/follow1_pos_back',
-        joint_command_topic='/joint_control',
-        gripper_command_topic='/joint_control',
-        pose_command_topic=None,
-        joint_state_msg_type='arm_control.msg:JointInformation',
-        gripper_state_msg_type='arm_control.msg:JointInformation',
-        ee_pose_msg_type='arm_control.msg:PosCmd',
-        joint_command_msg_type='arm_control.msg:JointControl',
-        gripper_command_msg_type='arm_control.msg:JointControl',
-        joint_state_field='joint_pos',
-        gripper_state_field='joint_pos[6]',
-        joint_command_field='joint_pos',
-        gripper_command_field='joint_pos[6]',
-        combine_joint_gripper_command=True,
-        gripper_command_index=6,
-        joint_command_length=7,
-        joint_names=[],
-        use_depth_image=False))
+)
