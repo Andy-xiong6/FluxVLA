@@ -23,6 +23,37 @@ def resample_remaining(traj, offset):
     return traj[lo] + alpha * (traj[hi] - traj[lo])
 
 
+def interpolate_action_trajectory(actions, factor, arm_action_dim=None):
+    """Interpolate arm actions while holding non-arm dimensions per segment."""
+    actions = np.asarray(actions)
+    if actions.ndim != 2 or len(actions) <= 1:
+        return actions
+
+    factor = int(factor)
+    if factor <= 1:
+        return actions
+
+    arm_dim = actions.shape[1] if arm_action_dim is None else arm_action_dim
+    arm_dim = min(int(arm_dim), actions.shape[1])
+    out_len = (len(actions) - 1) * factor + 1
+    interpolated = np.empty((out_len, actions.shape[1]), dtype=actions.dtype)
+
+    out_idx = 0
+    for idx in range(len(actions) - 1):
+        start = actions[idx]
+        end = actions[idx + 1]
+        for step in range(factor):
+            alpha = step / factor
+            interpolated[out_idx, :arm_dim] = (
+                start[:arm_dim] + alpha * (end[:arm_dim] - start[:arm_dim]))
+            if arm_dim < actions.shape[1]:
+                interpolated[out_idx, arm_dim:] = start[arm_dim:]
+            out_idx += 1
+
+    interpolated[-1] = actions[-1]
+    return interpolated
+
+
 @RUNNERS.register_module()
 class ARXInferenceRunner(BaseInferenceRunner):
     """Runner for ARX X5 real-robot inference.
@@ -69,6 +100,8 @@ class ARXInferenceRunner(BaseInferenceRunner):
                  rtc_config: dict = None,
                  dry_run: bool = False,
                  preview_action_count: int = 5,
+                 interpolate_actions: bool = False,
+                 action_interpolation_factor: int = 1,
                  *args,
                  **kwargs):
         legacy_gripper_thr = kwargs.pop('gripper_threshold', None)
@@ -190,6 +223,8 @@ class ARXInferenceRunner(BaseInferenceRunner):
         self.dt = 1.0 / self.publish_rate
         self.dry_run = dry_run
         self.preview_action_count = preview_action_count
+        self.interpolate_actions = interpolate_actions
+        self.action_interpolation_factor = action_interpolation_factor
 
     def get_ros_observation(
         self
@@ -357,6 +392,22 @@ class ARXInferenceRunner(BaseInferenceRunner):
     def _execute_actions(self, actions: np.ndarray, rate):
         ctx = self._action_ctx
 
+        if self.async_execution and self._prev_ctx is not None:
+            ctx.action_timestamp = ctx.inference_start
+            offset = (time.time() - ctx.action_timestamp) / self.dt
+            actions = resample_remaining(actions, offset)
+        else:
+            ctx.action_timestamp = time.time()
+            if self.execute_horizon is not None:
+                actions = actions[:self.execute_horizon]
+
+        publish_dt = self.dt
+        interpolation_factor = int(self.action_interpolation_factor)
+        if self.interpolate_actions and interpolation_factor > 1:
+            actions = interpolate_action_trajectory(
+                actions, interpolation_factor, self.arm_action_dim)
+            publish_dt = self.dt / interpolation_factor
+
         ctx.t_first_publish = time.time()
         n_actions_total = int(actions.shape[0]) if actions.ndim >= 1 else 0
         gripper_dim_emit = (1 if (actions.ndim >= 2
@@ -366,19 +417,10 @@ class ARXInferenceRunner(BaseInferenceRunner):
         self._emit_action_publish(
             ctx,
             n_actions=n_actions_total,
-            dt=self.dt,
+            dt=publish_dt,
             arm_action_dim=self.arm_action_dim,
             gripper_dim=gripper_dim_emit,
             is_dry_run=is_dry_run_emit)
-
-        if self.async_execution and self._prev_ctx is not None:
-            ctx.action_timestamp = ctx.inference_start
-            offset = (time.time() - ctx.action_timestamp) / self.dt
-            actions = resample_remaining(actions, offset)
-        else:
-            ctx.action_timestamp = time.time()
-            if self.execute_horizon is not None:
-                actions = actions[:self.execute_horizon]
 
         if self.disable_puppet_arm or self.dry_run:
             preview_count = min(len(actions), self.preview_action_count)
@@ -399,12 +441,15 @@ class ARXInferenceRunner(BaseInferenceRunner):
         if hasattr(self.ros_operator, 'execute_trajectory'):
             self.ros_operator.execute_trajectory(
                 joint_trajectory=actions[:, :self.arm_action_dim],
-                dt=self.dt,
+                dt=publish_dt,
                 async_exec=self.async_execution,
                 gripper_trajectory=gripper_actions,
                 joint_command_mode=self.joint_command_mode)
         else:
+            import rospy
+
             joint_cmd = getattr(self.ros_operator, self.joint_command_mode)
+            local_rate = rospy.Rate(1.0 / publish_dt)
             for action in actions:
                 if (getattr(self.ros_operator, 'combine_joint_gripper_command',
                             False) and action.shape[0] > self.arm_action_dim):
@@ -417,7 +462,7 @@ class ARXInferenceRunner(BaseInferenceRunner):
                                 'combine_joint_gripper_command', False)
                         and action.shape[0] > self.arm_action_dim):
                     self.ros_operator.movegrip(action[self.arm_action_dim])
-                rate.sleep()
+                local_rate.sleep()
 
         if self.async_execution and self.execute_horizon is not None:
             time.sleep(self.execute_horizon * self.dt)
