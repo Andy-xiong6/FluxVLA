@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import io
 import os
 import threading
@@ -26,7 +27,8 @@ import torch
 from safetensors.torch import load_file
 
 from fluxvla.engines.utils.torch_utils import set_seed_everywhere
-from ..utils import build_operator_from_cfg, initialize_overwatch
+from ..utils import (build_metrics_manager_from_cfg, build_operator_from_cfg,
+                     initialize_overwatch)
 from ..utils.name_map import str_to_dtype
 
 overwatch = initialize_overwatch(__name__)
@@ -95,6 +97,8 @@ class BaseInferenceRunner:
                  mixed_precision_dtype: str = 'float32',
                  enable_mixed_precision: bool = True,
                  remote_inference: Dict = None,
+                 metrics: Dict = None,
+                 config_path: Optional[str] = None,
                  **kwargs):
         from fluxvla.engines import (build_dataset_from_cfg,
                                      build_transform_from_cfg,
@@ -168,6 +172,32 @@ class BaseInferenceRunner:
         self._prev_ctx = None
         self._action_ctx = SimpleNamespace()
 
+        # ------------------------------------------------------------------
+        # Metrics recorder (independent module, optional).
+        # ``metrics`` is the user-facing config dict from the inference
+        # section; ``config_path`` is forwarded by inference_real_robot.py.
+        # The MetricsManager is constructed AFTER ros_operator so that
+        # rospy.init_node has already been invoked (see ARXROSOperator).
+        # ------------------------------------------------------------------
+        self.metrics_cfg = metrics
+        self.config_path = config_path
+        self._last_task_id: Optional[str] = None
+        self._last_num_times: int = 0
+        self.metrics = None
+        self._inference_cfg_dict: Dict = self._extract_inference_cfg_snapshot(
+            kwargs.get('cfg'))
+        try:
+            self.metrics = build_metrics_manager_from_cfg(
+                self.metrics_cfg,
+                runtime_meta_provider=self._build_runtime_meta,
+                inference_config_provider=self._build_inference_config,
+                ckpt_path=self.ckpt_path,
+                config_path=self.config_path)
+        except Exception as e:
+            overwatch.warning(f'Metrics initialization failed: {e}. '
+                              f'Continuing without metrics recording.')
+            self.metrics = None
+
     def _init_zmq_client(self, cfg: Dict):
         """Initialize ZMQ client for remote inference.
 
@@ -207,6 +237,73 @@ class BaseInferenceRunner:
         self._payload_bytes = 0
         self._resp_bytes = 0
         self.last_profile = {}
+
+    # ------------------------------------------------------------------
+    # Metrics integration helpers.
+    # ------------------------------------------------------------------
+    def _extract_inference_cfg_snapshot(self, cfg) -> Dict:
+        """Extract a JSON-friendly snapshot of cfg.inference (sans cycles)."""
+        from ..utils.metrics_recorder import _jsonable
+        if cfg is None or not hasattr(cfg, 'inference'):
+            return {}
+        try:
+            inference_cfg = cfg.inference
+            if hasattr(inference_cfg, 'to_dict'):
+                raw = inference_cfg.to_dict()
+            elif hasattr(inference_cfg, '_cfg_dict'):
+                raw = dict(inference_cfg._cfg_dict)
+            else:
+                raw = dict(inference_cfg)
+            for drop_key in ('cfg', 'config_path'):
+                raw.pop(drop_key, None)
+            return _jsonable(raw)
+        except Exception as e:
+            overwatch.warning(f'Failed to snapshot inference cfg: {e}')
+            return {}
+
+    def _build_runtime_meta(self) -> Dict:
+        return {
+            'publish_rate': getattr(self, 'publish_rate', None),
+            'action_chunk': getattr(self, 'action_chunk', None),
+            'dt': (1.0 / self.publish_rate
+                   if getattr(self, 'publish_rate', None) else None),
+            'arm_action_dim': getattr(self, 'arm_action_dim', None),
+            'joint_indices': getattr(self, 'joint_indices', None),
+            'dry_run': bool(getattr(self, 'dry_run', False)),
+            'async_execution': bool(getattr(self, 'async_execution', False)),
+            'binarize_gripper': bool(getattr(self, 'binarize_gripper',
+                                             False)),
+        }
+
+    def _build_inference_config(self) -> Dict:
+        return self._inference_cfg_dict or {}
+
+    def _metrics_episode_ctx(self, task_id: str, instruction: str,
+                             num_times: int):
+        if self.metrics is None:
+            return contextlib.nullcontext()
+        return self.metrics.episode(task_id, instruction, num_times)
+
+    def _metrics_inference_ctx(self, ctx):
+        if self.metrics is None:
+            return contextlib.nullcontext()
+        return self.metrics.inference(ctx)
+
+    def _emit_action_publish(self, ctx, n_actions: int, dt: float,
+                             arm_action_dim: int, gripper_dim: int,
+                             is_dry_run: bool):
+        if self.metrics is None:
+            return
+        try:
+            self.metrics.action_publish(
+                ctx,
+                n_actions=n_actions,
+                dt=dt,
+                arm_action_dim=arm_action_dim,
+                gripper_dim=gripper_dim,
+                is_dry_run=is_dry_run)
+        except Exception as e:
+            overwatch.warning(f'metrics.action_publish failed: {e}')
 
     def ping(self) -> bool:
         """Health-check the remote ZMQ server."""
@@ -339,25 +436,32 @@ class BaseInferenceRunner:
 
         while t < self.max_publish_step and not rospy.is_shutdown():
             instructions = self._get_user_task_instruction(default_instruction)
-            self._prev_ctx = None
-            for instruction in instructions:
-                self._action_ctx = SimpleNamespace()
-                self._action_ctx.instruction = instruction
-                inputs = self._preprocess(instruction)
+            task_id = self._last_task_id or ''
+            num_times = self._last_num_times or len(instructions)
+            instruction_for_meta = (instructions[0]
+                                    if instructions else default_instruction)
+            with self._metrics_episode_ctx(task_id, instruction_for_meta,
+                                           num_times):
+                self._prev_ctx = None
+                for instruction in instructions:
+                    self._action_ctx = SimpleNamespace()
+                    self._action_ctx.instruction = instruction
+                    inputs = self._preprocess(instruction)
 
-                with torch.autocast(
-                        'cuda',
-                        dtype=self.mixed_precision_dtype,
-                        enabled=(self.enable_mixed_precision
-                                 and not self._use_remote)):
-                    raw_action = self._predict_action(inputs)
+                    with torch.autocast(
+                            'cuda',
+                            dtype=self.mixed_precision_dtype,
+                            enabled=(self.enable_mixed_precision
+                                     and not self._use_remote)):
+                        with self._metrics_inference_ctx(self._action_ctx):
+                            raw_action = self._predict_action(inputs)
 
-                actions = self._postprocess_actions(raw_action)
-                self._execute_actions(actions, rate)
+                    actions = self._postprocess_actions(raw_action)
+                    self._execute_actions(actions, rate)
 
-                self._prev_ctx = self._action_ctx
-                t += self.action_chunk
-                overwatch.info(f'Published Step {t}')
+                    self._prev_ctx = self._action_ctx
+                    t += self.action_chunk
+                    overwatch.info(f'Published Step {t}')
 
     def _preprocess(self, instruction: str) -> dict:
         """Observe environment and build model inputs.
@@ -508,6 +612,12 @@ class BaseInferenceRunner:
     def _get_user_task_instruction(self, default_instruction: str) -> str:
         """Get task instruction from user input.
 
+        Side effects:
+            ``self._last_task_id`` and ``self._last_num_times`` are updated
+            so that the metrics episode-start hook can pick them up.  The
+            return signature is unchanged (List[str]) for backwards
+            compatibility with subclasses.
+
         Args:
             default_instruction (str): Default instruction if no valid input.
 
@@ -526,6 +636,8 @@ class BaseInferenceRunner:
 
         num_times = int(input('Number of times to repeat the task: '))
         task_description = self._get_task_description(task_id)
+        self._last_task_id = task_id
+        self._last_num_times = int(num_times)
         return [task_description] * num_times
 
     def get_observation_statistics(self) -> Dict:
@@ -553,6 +665,12 @@ class BaseInferenceRunner:
         and action context.
         """
         overwatch.info('Cleaning up BaseInferenceRunner')
+        if self.metrics is not None:
+            try:
+                self.metrics.close()
+            except Exception as e:
+                overwatch.warning(f'metrics.close failed: {e}')
+            self.metrics = None
         if self._use_remote:
             import zmq
             if hasattr(self, '_zmq_socket') and not self._zmq_socket.closed:

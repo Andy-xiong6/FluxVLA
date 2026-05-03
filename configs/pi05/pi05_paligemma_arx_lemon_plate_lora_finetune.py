@@ -325,4 +325,11 @@ inference = dict(
         gripper_command_index=6,
         joint_command_length=7,
         joint_names=[],
-        use_depth_image=False))
+        use_depth_image=False),
+    metrics=dict(
+        enabled=True,
+        output_root='work_dirs/metrics',
+        joint_state_topic='/joint_information',
+        joint_state_msg_type='arm_control.msg:JointInformation',
+        subscribe_queue_size=200,
+    ))

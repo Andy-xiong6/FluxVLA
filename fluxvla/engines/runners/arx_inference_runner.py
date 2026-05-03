@@ -1,16 +1,4 @@
-# Copyright 2026 Limx Dynamics
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+
 
 import time
 from typing import Dict, List, Optional, Tuple
@@ -205,7 +193,7 @@ class ARXInferenceRunner(BaseInferenceRunner):
 
     def get_ros_observation(
         self
-    ) -> Tuple[np.ndarray, np.ndarray, 'JointState', 'Any', 'Any']:  # noqa: F821
+    ) -> Tuple[np.ndarray, np.ndarray, 'JointState', 'Any', 'Any', float]:  # noqa: F821, E501
         import rospy
 
         from ..utils import initialize_overwatch
@@ -232,7 +220,7 @@ class ARXInferenceRunner(BaseInferenceRunner):
              frame_time_max) = result
 
             return (img_third, img_wrist, joint_state, ee_pose,
-                    gripper_state)
+                    gripper_state, frame_time_min)
 
     def _select_arm_joints(self, joint_positions: List[float]) -> np.ndarray:
         joint_positions = np.asarray(joint_positions)
@@ -250,8 +238,8 @@ class ARXInferenceRunner(BaseInferenceRunner):
                 dummy_obs[camera_name] = None
             self.observation_window.append(dummy_obs)
 
-        img_third, img_wrist, joint_state, ee_pose, gripper_state = (
-            self.get_ros_observation())
+        (img_third, img_wrist, joint_state, ee_pose, gripper_state,
+         frame_time_min) = self.get_ros_observation()
 
         img_third = self._apply_jpeg_compression(img_third)
         img_wrist = self._apply_jpeg_compression(img_wrist)
@@ -269,6 +257,12 @@ class ARXInferenceRunner(BaseInferenceRunner):
         }
         if ee_pose is not None:
             observation['ee_pose'] = ee_pose
+
+        if self._action_ctx is not None:
+            try:
+                self._action_ctx.t_obs = float(frame_time_min)
+            except (TypeError, ValueError):
+                self._action_ctx.t_obs = None
 
         self.observation_window.append(observation)
         return self.observation_window[-1]
@@ -362,6 +356,20 @@ class ARXInferenceRunner(BaseInferenceRunner):
 
     def _execute_actions(self, actions: np.ndarray, rate):
         ctx = self._action_ctx
+
+        ctx.t_first_publish = time.time()
+        n_actions_total = int(actions.shape[0]) if actions.ndim >= 1 else 0
+        gripper_dim_emit = (1 if (actions.ndim >= 2
+                                  and actions.shape[1] > self.arm_action_dim)
+                            else 0)
+        is_dry_run_emit = bool(self.disable_puppet_arm or self.dry_run)
+        self._emit_action_publish(
+            ctx,
+            n_actions=n_actions_total,
+            dt=self.dt,
+            arm_action_dim=self.arm_action_dim,
+            gripper_dim=gripper_dim_emit,
+            is_dry_run=is_dry_run_emit)
 
         if self.async_execution and self._prev_ctx is not None:
             ctx.action_timestamp = ctx.inference_start

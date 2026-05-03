@@ -45,6 +45,7 @@ if __name__ == '__main__':
     args = parse_args()
     cfg = Config.fromfile(args.config)
     cfg.inference.ckpt_path = args.ckpt_path
+    cfg.inference.config_path = args.config
     cfg.inference.cfg = cfg
     inference_runner = build_runner_from_cfg(cfg.inference)
     inference_runner.run_setup()
