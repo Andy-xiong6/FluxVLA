@@ -249,4 +249,9 @@ eval = dict(
         norm_type='mean_std',
         action_dim=7,
     ),
+    metrics=dict(
+        enabled=True,
+        output_root='work_dirs/metrics_libero_spatial',
+        control_freq_hz=30.0,
+    ),
 )

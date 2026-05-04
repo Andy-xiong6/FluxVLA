@@ -53,6 +53,7 @@ if __name__ == '__main__':
         cfg.merge_from_dict(args.cfg_options)
     cfg.eval.cfg = cfg
     cfg.eval.ckpt_path = args.ckpt_path
+    cfg.eval.config_path = args.config
     if hasattr(cfg.eval,
                'processor') and not hasattr(cfg.eval.processor, 'model_path'):
         cfg.eval.processor.model_path = args.ckpt_path

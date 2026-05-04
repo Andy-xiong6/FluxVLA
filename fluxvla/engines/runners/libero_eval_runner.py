@@ -17,18 +17,23 @@ import json
 import math
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import tqdm
 from libero.libero import benchmark
 from safetensors.torch import load_file
 
-from fluxvla.engines.utils import initialize_overwatch
+from fluxvla.engines.utils import (build_sim_metrics_manager_from_cfg,
+                                   initialize_overwatch)
 from fluxvla.engines.utils.eval_utils import (get_libero_dummy_action,
                                               get_libero_env,
+                                              quat2axisangle,
                                               save_rollout_video)
 from fluxvla.engines.utils.name_map import str_to_dtype
 from fluxvla.engines.utils.torch_utils import set_seed_everywhere
@@ -80,7 +85,9 @@ class LiberoEvalRunner:
                  num_trials_per_task: int = 50,
                  num_steps_wait: int = 10,
                  mixed_precision_dtype: str = 'bf16',
-                 enable_mixed_precision_training: bool = True):
+                 enable_mixed_precision_training: bool = True,
+                 metrics: Dict = None,
+                 config_path: str = None):
         from fluxvla.engines import (build_dataset_from_cfg,
                                      build_transform_from_cfg,
                                      build_vla_from_cfg)
@@ -150,6 +157,22 @@ class LiberoEvalRunner:
         self.mixed_precision_dtype = str_to_dtype(mixed_precision_dtype)
         self.enable_mixed_precision_training = enable_mixed_precision_training
         self.distributed_state = overwatch.distributed_state
+        self.metrics_cfg = metrics
+        self.config_path = config_path
+        self.metrics = None
+        self._eval_cfg_snapshot = self._extract_eval_cfg_snapshot(cfg)
+        try:
+            self.metrics = build_sim_metrics_manager_from_cfg(
+                self.metrics_cfg,
+                runtime_meta_provider=self._build_metrics_runtime_meta,
+                inference_config_provider=self._build_metrics_eval_config,
+                ckpt_path=self.ckpt_path,
+                config_path=self.config_path,
+                worker_id=f'rank{overwatch.rank()}')
+        except Exception as e:
+            overwatch.warning(f'Sim metrics initialization failed: {e}. '
+                              f'Continuing without metrics recording.')
+            self.metrics = None
 
         if os.path.isfile(data_stat_path):
             with open(data_stat_path, 'r') as f:
@@ -161,6 +184,109 @@ class LiberoEvalRunner:
                 'You can ignore this if you are loading the base VLA (i.e. not fine-tuned) checkpoint.'  # noqa: E501
                 'Otherwise, you may run into errors when trying to call `predict_action()` due to an absent `unnorm_key`.'  # noqa: E501
             )
+
+    def _extract_eval_cfg_snapshot(self, cfg) -> Dict:
+        from fluxvla.engines.utils.metrics_recorder import _jsonable
+        try:
+            if hasattr(cfg, 'eval'):
+                eval_cfg = cfg.eval
+                if hasattr(eval_cfg, 'to_dict'):
+                    raw = eval_cfg.to_dict()
+                elif hasattr(eval_cfg, '_cfg_dict'):
+                    raw = dict(eval_cfg._cfg_dict)
+                else:
+                    raw = dict(eval_cfg)
+            else:
+                raw = {}
+            for drop_key in ('cfg', 'config_path'):
+                raw.pop(drop_key, None)
+            return _jsonable(raw)
+        except Exception as e:
+            overwatch.warning(f'Failed to snapshot eval cfg: {e}')
+            return {}
+
+    def _build_metrics_runtime_meta(self) -> Dict:
+        control_freq_hz = 30.0
+        if self.metrics_cfg is not None:
+            control_freq_hz = self.metrics_cfg.get('control_freq_hz',
+                                                   control_freq_hz)
+        return {
+            'publish_rate': control_freq_hz,
+            'dt': 1.0 / control_freq_hz if control_freq_hz else None,
+            'action_chunk': self.eval_chunk_size,
+            'arm_action_dim': 6,
+            'gripper_dim': 1,
+            'dry_run': False,
+            'async_execution': False,
+            'binarize_gripper': False,
+            'simulator': 'libero',
+            'task_suite_name': self.task_suite_name,
+        }
+
+    def _build_metrics_eval_config(self) -> Dict:
+        return self._eval_cfg_snapshot or {}
+
+    def _metrics_episode_ctx(self, task_id: str, instruction: str,
+                             num_times: int):
+        if self.metrics is None:
+            return nullcontext()
+        return self.metrics.episode(task_id, instruction, num_times)
+
+    def _metrics_inference_ctx(self, ctx):
+        if self.metrics is None:
+            return nullcontext()
+        return self.metrics.inference(ctx)
+
+    def _emit_action_publish(self, ctx, n_actions: int):
+        if self.metrics is None or n_actions <= 0:
+            return
+        control_freq_hz = self._build_metrics_runtime_meta()['publish_rate']
+        dt = 1.0 / control_freq_hz if control_freq_hz else 0.0
+        self.metrics.action_publish(
+            ctx,
+            n_actions=n_actions,
+            dt=dt,
+            arm_action_dim=6,
+            gripper_dim=1,
+            is_dry_run=False)
+
+    def _mark_episode_success(self, success: bool):
+        if self.metrics is not None:
+            self.metrics.mark_success(success)
+
+    def _sim_joint_pos_from_obs(self, obs: Dict):
+        try:
+            pos = np.asarray(obs.get('robot0_eef_pos', []),
+                             dtype=np.float64).reshape(-1)[:3]
+            quat = np.asarray(obs.get('robot0_eef_quat', []),
+                              dtype=np.float64).reshape(-1)[:4]
+            if quat.shape[0] == 4:
+                axisangle = quat2axisangle(quat.copy())
+            else:
+                axisangle = np.zeros(3, dtype=np.float64)
+            gripper = np.asarray(obs.get('robot0_gripper_qpos', []),
+                                 dtype=np.float64).reshape(-1)
+            grip_val = gripper[:1] if gripper.size else np.zeros(1)
+            joint_pos = np.concatenate([pos, axisangle, grip_val])
+            if joint_pos.shape[0] < 7:
+                joint_pos = np.pad(joint_pos, (0, 7 - joint_pos.shape[0]))
+            return joint_pos[:7]
+        except Exception:
+            return np.zeros(7, dtype=np.float64)
+
+    def _write_sim_jointstate(self, obs: Dict, action, sim_step: int):
+        if self.metrics is None:
+            return
+        control_freq_hz = self._build_metrics_runtime_meta()['publish_rate']
+        dt = 1.0 / control_freq_hz if control_freq_hz else 0.0
+        joint_pos = self._sim_joint_pos_from_obs(obs)
+        joint_vel = np.asarray(action, dtype=np.float64).reshape(-1)[:7]
+        if joint_vel.shape[0] < 7:
+            joint_vel = np.pad(joint_vel, (0, 7 - joint_vel.shape[0]))
+        self.metrics.write_sim_jointstate(
+            t_sim=sim_step * dt,
+            joint_pos=joint_pos,
+            joint_vel=joint_vel)
 
     def run_setup(self):
         """Set up the evaluation environment and model."""
@@ -224,6 +350,7 @@ class LiberoEvalRunner:
                 f'Action un-norm key {unnorm_key} '
                 'not found in VLA norm_stats!')
         for id in range(num_local_episodes):
+            done = False
             if id >= len(local_episodes):
                 step_tensor = torch.zeros(
                     1, device=torch.cuda.current_device())
@@ -275,53 +402,80 @@ class LiberoEvalRunner:
                 overwatch.info(f'Starting episode {trial_id+1}...')
 
                 log_file.write(f'Starting episode {trial_id+1}...\n')
-                while t < max_steps + self.num_steps_wait:
-                    # IMPORTANT: Do nothing for the first
-                    # few timesteps
-                    # because the simulator drops objects
-                    # and we need to wait for them to fall
-                    if t < self.num_steps_wait:
-                        obs, reward, done, info = env.step(
-                            get_libero_dummy_action())
-                        t += 1
-                        continue
-                    obs['task_description'] = task_description
-                    obs['is_new_episode'] = is_new_episode
-                    batch, replay_img = self.dataset(obs)
-                    is_new_episode = False
-                    batch['unnorm_key'] = unnorm_key
-                    if len(replay_images) == 0:
-                        replay_images.append(replay_img)
-                    with torch.autocast(
-                            'cuda',
-                            dtype=self.mixed_precision_dtype,
-                            enabled=self.enable_mixed_precision_training):
-                        with torch.no_grad():
-                            actions = self.vla.predict_action(**batch)
-                    if len(actions.shape) == 3:
-                        actions = actions[
-                            0, :self.eval_chunk_size, :].float().cpu().numpy()
-                    else:
-                        assert len(actions.shape) == 2, \
-                            f'Unexpected action shape: {actions.shape}'
-                        actions = actions[0, None, :].float().cpu().numpy()
-                    for action in actions:
-                        inputs = dict(
-                            action=action,
-                            task_suite_name=self.task_suite_name,
-                        )
-                        action_denormed = self.denormalize_action(inputs)
-                        obs, reward, done, info = env.step(
-                            action_denormed.tolist())
+                metrics_task_id = f'task{task_id:02d}_trial{trial_id:03d}'
+                sim_step = 0
+                with self._metrics_episode_ctx(
+                        metrics_task_id, task_description,
+                        self.num_trials_per_task):
+                    while t < max_steps + self.num_steps_wait:
+                        # IMPORTANT: Do nothing for the first
+                        # few timesteps
+                        # because the simulator drops objects
+                        # and we need to wait for them to fall
+                        if t < self.num_steps_wait:
+                            obs, reward, done, info = env.step(
+                                get_libero_dummy_action())
+                            t += 1
+                            continue
                         obs['task_description'] = task_description
+                        obs['is_new_episode'] = is_new_episode
+                        obs_time = time.time()
                         batch, replay_img = self.dataset(obs)
-                        replay_images.append(replay_img)
+                        is_new_episode = False
+                        batch['unnorm_key'] = unnorm_key
+                        if len(replay_images) == 0:
+                            replay_images.append(replay_img)
+                        ctx = SimpleNamespace(
+                            instruction=task_description,
+                            t_obs=obs_time,
+                            inference_start=time.time(),
+                            inference_elapsed=0.0,
+                            raw_actions=None,
+                            t_first_publish=None)
+                        with torch.autocast(
+                                'cuda',
+                                dtype=self.mixed_precision_dtype,
+                                enabled=self.enable_mixed_precision_training):
+                            with torch.no_grad():
+                                with self._metrics_inference_ctx(ctx):
+                                    actions = self.vla.predict_action(**batch)
+                                    ctx.inference_elapsed = (
+                                        time.time() - ctx.inference_start)
+                                    ctx.raw_actions = actions
+                        if len(actions.shape) == 3:
+                            actions = actions[
+                                0, :self.eval_chunk_size,
+                                :].float().cpu().numpy()
+                        else:
+                            assert len(actions.shape) == 2, \
+                                f'Unexpected action shape: {actions.shape}'
+                            actions = actions[0, None, :].float().cpu().numpy()
+                        published_actions = 0
+                        for action in actions:
+                            inputs = dict(
+                                action=action,
+                                task_suite_name=self.task_suite_name,
+                            )
+                            action_denormed = self.denormalize_action(inputs)
+                            if ctx.t_first_publish is None:
+                                ctx.t_first_publish = time.time()
+                            obs, reward, done, info = env.step(
+                                action_denormed.tolist())
+                            published_actions += 1
+                            self._write_sim_jointstate(
+                                obs, action_denormed, sim_step)
+                            sim_step += 1
+                            obs['task_description'] = task_description
+                            batch, replay_img = self.dataset(obs)
+                            replay_images.append(replay_img)
+                            if done:
+                                total_successes += 1
+                                break
+                            t += 1
+                        self._emit_action_publish(ctx, published_actions)
                         if done:
-                            total_successes += 1
                             break
-                        t += 1
-                    if done:
-                        break
+                    self._mark_episode_success(bool(done))
                 total_episodes += 1
                 step_tensor = torch.ones(1, device=torch.cuda.current_device())
                 # Save a replay video of the episode

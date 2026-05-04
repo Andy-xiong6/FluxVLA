@@ -9,6 +9,7 @@ Implements the design described in the project plan:
 """
 
 import contextlib
+import csv
 import importlib
 import json
 import os
@@ -606,5 +607,270 @@ def build_metrics_manager_from_cfg(
         inference_config_provider=inference_config_provider,
         ckpt_path=ckpt_path,
         config_path=config_path)
+    manager.start()
+    return manager
+
+
+class SimMetricsManager:
+    """Metrics manager for simulator rollouts.
+
+    Writes the same episode directory layout as ``MetricsManager`` without a
+    ROS subscription. Simulator state samples are written into
+    ``jointstate.jsonl`` so the existing offline analyzer can be reused.
+    """
+
+    def __init__(self,
+                 output_root: str,
+                 control_freq_hz: float = 30.0,
+                 runtime_meta_provider: Optional[Callable[[], Dict]] = None,
+                 inference_config_provider:
+                 Optional[Callable[[], Dict]] = None,
+                 ckpt_path: Optional[str] = None,
+                 config_path: Optional[str] = None,
+                 worker_id: Optional[str] = None):
+        self.output_root = os.path.abspath(output_root)
+        self.control_freq_hz = float(control_freq_hz)
+        self.runtime_meta_provider = (runtime_meta_provider
+                                      if runtime_meta_provider is not None
+                                      else lambda: {})
+        self.inference_config_provider = (inference_config_provider
+                                          if inference_config_provider
+                                          is not None else lambda: {})
+        self.ckpt_path = ckpt_path
+        self.config_path = config_path
+        self.worker_id = worker_id
+        self._active_writer: Optional[EpisodeWriter] = None
+        self._active_lock = threading.Lock()
+        self._episode_counters: Dict[str, int] = {}
+        self._manifest_path = os.path.join(self.output_root,
+                                           MANIFEST_FILENAME)
+        self._success_csv_path = os.path.join(self.output_root,
+                                              SUCCESS_CSV_FILENAME)
+        self._manifest_lock = threading.Lock()
+        self._success_lock = threading.Lock()
+
+    def start(self):
+        os.makedirs(self.output_root, exist_ok=True)
+        self._init_file_if_missing(self._manifest_path)
+        self._init_success_csv_if_missing()
+        overwatch.info(
+            f'SimMetricsManager writing LIBERO metrics to {self.output_root}')
+
+    def _init_file_if_missing(self, path: str):
+        if not os.path.exists(path):
+            try:
+                with open(path, 'a'):
+                    pass
+            except Exception as e:
+                overwatch.warning(f'Failed to init {path}: {e}')
+
+    def _init_success_csv_if_missing(self):
+        try:
+            with open(self._success_csv_path, 'x', newline='') as fp:
+                writer = csv.DictWriter(
+                    fp,
+                    fieldnames=[
+                        'episode_id', 'success', 'task_id', 'instruction',
+                        'reason'
+                    ])
+                writer.writeheader()
+        except FileExistsError:
+            return
+        except Exception as e:
+            overwatch.warning(f'Failed to init success.csv: {e}')
+
+    def start_episode(self, task_id: str, instruction: str,
+                      num_times: int) -> EpisodeWriter:
+        ts = time.time()
+        task_key = f'{self.worker_id}_{task_id}' if self.worker_id else task_id
+        cnt = self._episode_counters.get(task_key, 0) + 1
+        self._episode_counters[task_key] = cnt
+        episode_id = _make_episode_id(task_key, cnt, ts)
+        episode_dir = os.path.join(self.output_root, episode_id)
+        try:
+            runtime_meta = self.runtime_meta_provider()
+        except Exception as e:
+            overwatch.warning(f'runtime_meta_provider failed: {e}')
+            runtime_meta = {}
+        try:
+            inference_cfg = self.inference_config_provider()
+        except Exception as e:
+            overwatch.warning(f'inference_config_provider failed: {e}')
+            inference_cfg = {}
+        runtime_meta = dict(runtime_meta or {})
+        runtime_meta.setdefault('publish_rate', self.control_freq_hz)
+        runtime_meta.setdefault('dt', 1.0 / self.control_freq_hz
+                                if self.control_freq_hz > 0 else None)
+        runtime_meta.setdefault('simulator', 'libero')
+        writer = EpisodeWriter(
+            episode_id=episode_id,
+            episode_dir=episode_dir,
+            task_id=task_id,
+            instruction=instruction,
+            num_times=num_times,
+            ckpt_path=self.ckpt_path,
+            config_path=self.config_path,
+            runtime_meta=runtime_meta,
+            inference_config_snapshot=inference_cfg)
+        writer.write_event_episode_start(
+            publish_rate=runtime_meta.get('publish_rate'),
+            action_chunk=runtime_meta.get('action_chunk'),
+            arm_action_dim=runtime_meta.get('arm_action_dim'),
+            dry_run=runtime_meta.get('dry_run', False),
+            async_execution=runtime_meta.get('async_execution', False),
+            binarize_gripper=runtime_meta.get('binarize_gripper', False))
+        with self._active_lock:
+            self._active_writer = writer
+        return writer
+
+    def close_current_episode(self,
+                              reason: str = 'completed',
+                              success: Optional[bool] = None):
+        with self._active_lock:
+            writer = self._active_writer
+            self._active_writer = None
+        if writer is None:
+            return
+        try:
+            summary = writer.write_event_episode_end(reason=reason)
+            self._append_manifest(summary)
+            if success is not None:
+                self._append_success(summary, success)
+        finally:
+            writer.close()
+
+    def _append_manifest(self, summary: Dict):
+        line = json.dumps(summary, ensure_ascii=False, allow_nan=False)
+        with self._manifest_lock:
+            try:
+                with open(self._manifest_path, 'a', buffering=1) as fp:
+                    fp.write(line + '\n')
+            except Exception as e:
+                overwatch.warning(f'Failed to append manifest: {e}')
+
+    def _append_success(self, summary: Dict, success: bool):
+        row = {
+            'episode_id': summary.get('episode_id'),
+            'success': int(bool(success)),
+            'task_id': summary.get('task_id'),
+            'instruction': summary.get('instruction'),
+            'reason': summary.get('reason'),
+        }
+        with self._success_lock:
+            try:
+                with open(self._success_csv_path, 'a', newline='') as fp:
+                    writer = csv.DictWriter(
+                        fp,
+                        fieldnames=[
+                            'episode_id', 'success', 'task_id',
+                            'instruction', 'reason'
+                        ])
+                    writer.writerow(row)
+            except Exception as e:
+                overwatch.warning(f'Failed to append success.csv: {e}')
+
+    @contextlib.contextmanager
+    def episode(self, task_id: str, instruction: str, num_times: int):
+        self.start_episode(task_id, instruction, num_times)
+        reason = 'completed'
+        success = None
+        try:
+            yield self._active_writer
+        except KeyboardInterrupt:
+            reason = 'interrupted'
+            raise
+        except Exception:
+            reason = 'exception'
+            raise
+        finally:
+            with self._active_lock:
+                writer = self._active_writer
+            if writer is not None and hasattr(writer, '_sim_success'):
+                success = bool(getattr(writer, '_sim_success'))
+            self.close_current_episode(reason=reason, success=success)
+
+    @contextlib.contextmanager
+    def inference(self, ctx):
+        try:
+            yield
+        finally:
+            with self._active_lock:
+                writer = self._active_writer
+            if writer is None:
+                return
+            instruction = getattr(ctx, 'instruction', '')
+            try:
+                writer.write_event_inference(ctx, instruction)
+            except Exception as e:
+                overwatch.warning(f'Failed to write inference event: {e}')
+
+    def action_publish(self, ctx, n_actions: int, dt: float,
+                       arm_action_dim: int, gripper_dim: int,
+                       is_dry_run: bool):
+        with self._active_lock:
+            writer = self._active_writer
+        if writer is None:
+            return
+        try:
+            writer.write_event_action_publish(
+                ctx,
+                n_actions=n_actions,
+                dt=dt,
+                arm_action_dim=arm_action_dim,
+                gripper_dim=gripper_dim,
+                is_dry_run=is_dry_run)
+        except Exception as e:
+            overwatch.warning(f'Failed to write action_publish event: {e}')
+
+    def write_sim_jointstate(self, t_sim: float, joint_pos, joint_vel):
+        with self._active_lock:
+            writer = self._active_writer
+        if writer is None:
+            return
+        try:
+            payload = {
+                't_wall': time.time(),
+                't_ros': float(t_sim),
+                'joint_pos': [float(x) for x in joint_pos],
+                'joint_vel': [float(x) for x in joint_vel],
+                'joint_cur': [],
+                'mode': 0,
+                'episode_id': writer.episode_id,
+            }
+            line = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+            with writer._lock:
+                writer._jointstate_fp.write(line + '\n')
+        except Exception as e:
+            overwatch.warning(f'Failed to write sim jointstate: {e}')
+
+    def mark_success(self, success: bool):
+        with self._active_lock:
+            writer = self._active_writer
+        if writer is not None:
+            setattr(writer, '_sim_success', bool(success))
+
+    def close(self):
+        self.close_current_episode(reason='shutdown')
+
+
+def build_sim_metrics_manager_from_cfg(
+        cfg: Optional[Dict],
+        runtime_meta_provider: Callable[[], Dict],
+        inference_config_provider: Callable[[], Dict],
+        ckpt_path: Optional[str] = None,
+        config_path: Optional[str] = None,
+        worker_id: Optional[str] = None) -> Optional[SimMetricsManager]:
+    if cfg is None:
+        return None
+    if not cfg.get('enabled', True):
+        return None
+    manager = SimMetricsManager(
+        output_root=cfg.get('output_root', 'work_dirs/metrics_libero'),
+        control_freq_hz=cfg.get('control_freq_hz', 30.0),
+        runtime_meta_provider=runtime_meta_provider,
+        inference_config_provider=inference_config_provider,
+        ckpt_path=ckpt_path,
+        config_path=config_path,
+        worker_id=worker_id)
     manager.start()
     return manager

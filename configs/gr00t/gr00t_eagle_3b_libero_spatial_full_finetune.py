@@ -215,4 +215,9 @@ eval = dict(
         type='DenormalizeLiberoAction',
         norm_type='mean_std',
     ),
+    metrics=dict(
+        enabled=True,
+        output_root='work_dirs/metrics_libero_spatial',
+        control_freq_hz=30.0,
+    ),
 )
