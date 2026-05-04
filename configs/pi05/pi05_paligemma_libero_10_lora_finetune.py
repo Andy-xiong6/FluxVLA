@@ -239,6 +239,25 @@ eval = dict(
     resize_size=224,
     num_trials_per_task=50,
     num_steps_wait=10,
+    execute_horizon=None,
+    rtc_config=dict(
+        enabled=False,
+        method='prefix',
+        prefix_len=5,
+    ),
+    arm_action_dim=6,
+    trajectory_stitching=dict(
+        enabled=False,
+        horizon=5,
+        gripper_mode='hold_then_switch',
+    ),
+    ruckig_smoothing=dict(
+        enabled=False,
+        max_velocity=[0.4, 0.4, 0.4, 0.6, 0.6, 0.8],
+        max_acceleration=[0.8, 0.8, 0.8, 1.2, 1.2, 1.6],
+        max_jerk=[2.0, 2.0, 2.0, 3.0, 3.0, 4.0],
+        fallback_to_linear=True,
+    ),
     seed=7,
     dataset=dict(
         type='LiberoParquetEvalDataset',

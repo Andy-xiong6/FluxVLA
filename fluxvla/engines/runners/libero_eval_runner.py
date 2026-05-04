@@ -37,6 +37,8 @@ from fluxvla.engines.utils.eval_utils import (get_libero_dummy_action,
                                               save_rollout_video)
 from fluxvla.engines.utils.name_map import str_to_dtype
 from fluxvla.engines.utils.torch_utils import set_seed_everywhere
+from fluxvla.engines.utils.trajectory_postprocessor import (
+    RuckigActionSmoother, TrajectoryStitcher, interpolate_action_trajectory)
 from ..utils.root import RUNNERS
 
 overwatch = initialize_overwatch(__name__)
@@ -102,6 +104,11 @@ class LiberoEvalRunner:
                  metrics: Dict = None,
                  rtc_config: Dict = None,
                  execute_horizon: int = None,
+                 arm_action_dim: int = 6,
+                 trajectory_stitching: Dict = None,
+                 ruckig_smoothing: Dict = None,
+                 interpolate_actions: bool = False,
+                 action_interpolation_factor: int = 1,
                  config_path: str = None):
         from fluxvla.engines import (build_dataset_from_cfg,
                                      build_transform_from_cfg,
@@ -175,6 +182,13 @@ class LiberoEvalRunner:
         self.metrics_cfg = metrics
         self.rtc_config = rtc_config
         self.execute_horizon = execute_horizon
+        self.arm_action_dim = int(arm_action_dim)
+        self.trajectory_stitcher = TrajectoryStitcher(
+            **(trajectory_stitching or {}))
+        self.ruckig_smoother = RuckigActionSmoother(
+            **(ruckig_smoothing or {}))
+        self.interpolate_actions = bool(interpolate_actions)
+        self.action_interpolation_factor = int(action_interpolation_factor)
         self.config_path = config_path
         self.metrics = None
         self._eval_cfg_snapshot = self._extract_eval_cfg_snapshot(cfg)
@@ -231,7 +245,7 @@ class LiberoEvalRunner:
             'publish_rate': control_freq_hz,
             'dt': 1.0 / control_freq_hz if control_freq_hz else None,
             'action_chunk': self.eval_chunk_size,
-            'arm_action_dim': 6,
+            'arm_action_dim': self.arm_action_dim,
             'gripper_dim': 1,
             'dry_run': False,
             'async_execution': False,
@@ -240,6 +254,12 @@ class LiberoEvalRunner:
             'task_suite_name': self.task_suite_name,
             'execute_horizon': self.execute_horizon,
             'rtc_config': self.rtc_config,
+            'trajectory_stitching_enabled': bool(
+                getattr(self.trajectory_stitcher, 'enabled', False)),
+            'ruckig_smoothing_enabled': bool(
+                getattr(self.ruckig_smoother, 'enabled', False)),
+            'interpolate_actions': self.interpolate_actions,
+            'action_interpolation_factor': self.action_interpolation_factor,
         }
 
     def _build_metrics_eval_config(self) -> Dict:
@@ -259,13 +279,16 @@ class LiberoEvalRunner:
     def _emit_action_publish(self, ctx, n_actions: int):
         if self.metrics is None or n_actions <= 0:
             return
-        control_freq_hz = self._build_metrics_runtime_meta()['publish_rate']
-        dt = 1.0 / control_freq_hz if control_freq_hz else 0.0
+        dt = getattr(ctx, 'executed_dt', None)
+        if dt is None:
+            control_freq_hz = self._build_metrics_runtime_meta()[
+                'publish_rate']
+            dt = 1.0 / control_freq_hz if control_freq_hz else 0.0
         self.metrics.action_publish(
             ctx,
             n_actions=n_actions,
             dt=dt,
-            arm_action_dim=6,
+            arm_action_dim=self.arm_action_dim,
             gripper_dim=1,
             is_dry_run=False)
 
@@ -326,6 +349,61 @@ class LiberoEvalRunner:
                     return max(actions.shape[0] - prefix_len, 1)
             return actions.shape[0]
         return min(max(int(self.execute_horizon), 1), actions.shape[0])
+
+    def _control_dt(self) -> float:
+        control_freq_hz = self._build_metrics_runtime_meta()['publish_rate']
+        return 1.0 / control_freq_hz if control_freq_hz else 1.0 / 30.0
+
+    def _denormalize_action_chunk(self, actions: np.ndarray) -> np.ndarray:
+        denormed = []
+        for action in actions:
+            inputs = dict(
+                action=action,
+                task_suite_name=self.task_suite_name,
+            )
+            denormed.append(np.asarray(self.denormalize_action(inputs)))
+        return np.asarray(denormed)
+
+    def _postprocess_action_chunk(self, actions: np.ndarray, ctx, prev_ctx,
+                                  sim_step: int):
+        publish_dt = self._control_dt()
+        if prev_ctx is not None:
+            prev_actions = getattr(prev_ctx, 'executed_actions', None)
+            prev_dt = getattr(prev_ctx, 'executed_dt', None)
+            prev_start = getattr(prev_ctx, 'executed_sim_step', None)
+            elapsed = None
+            if prev_start is not None:
+                elapsed = (sim_step - int(prev_start)) * float(prev_dt)
+            actions = self.trajectory_stitcher.stitch(
+                actions,
+                arm_action_dim=self.arm_action_dim,
+                previous_actions=prev_actions,
+                elapsed_since_previous_start=elapsed,
+                previous_dt=prev_dt)
+
+        ruckig_meta = {'applied': False, 'error': None}
+        if getattr(self.ruckig_smoother, 'enabled', False):
+            actions, ruckig_meta = self.ruckig_smoother.smooth(
+                actions, arm_action_dim=self.arm_action_dim, dt=publish_dt)
+
+        interpolation_factor = int(self.action_interpolation_factor)
+        should_interpolate = (
+            self.interpolate_actions and interpolation_factor > 1 and
+            (not ruckig_meta.get('applied')))
+        if should_interpolate:
+            actions = interpolate_action_trajectory(
+                actions, interpolation_factor, self.arm_action_dim)
+            publish_dt = publish_dt / interpolation_factor
+
+        if (ruckig_meta.get('error') and
+                not self.ruckig_smoother.fallback_to_linear):
+            raise RuntimeError('Ruckig smoothing failed: '
+                               f"{ruckig_meta['error']}")
+
+        ctx.executed_actions = np.asarray(actions).copy()
+        ctx.executed_dt = publish_dt
+        ctx.executed_sim_step = sim_step
+        return actions
 
     def _sim_joint_pos_from_obs(self, obs: Dict):
         try:
@@ -506,6 +584,9 @@ class LiberoEvalRunner:
                             inference_elapsed=0.0,
                             raw_actions=None,
                             action_sim_step=sim_step,
+                            executed_actions=None,
+                            executed_dt=None,
+                            executed_sim_step=None,
                             t_first_publish=None)
                         self._apply_rtc_inputs(batch, prev_ctx, sim_step)
                         with torch.autocast(
@@ -521,20 +602,19 @@ class LiberoEvalRunner:
                         raw_actions, actions = self._actions_to_numpy(actions)
                         ctx.raw_actions = raw_actions
                         n_execute = self._num_actions_to_execute(actions)
+                        actions = self._denormalize_action_chunk(actions)
+                        actions = self._postprocess_action_chunk(
+                            actions, ctx, prev_ctx, sim_step)
+                        n_execute = min(n_execute, actions.shape[0])
                         published_actions = 0
                         for action in actions[:n_execute]:
-                            inputs = dict(
-                                action=action,
-                                task_suite_name=self.task_suite_name,
-                            )
-                            action_denormed = self.denormalize_action(inputs)
                             if ctx.t_first_publish is None:
                                 ctx.t_first_publish = time.time()
                             obs, reward, done, info = env.step(
-                                action_denormed.tolist())
+                                action.tolist())
                             published_actions += 1
                             self._write_sim_jointstate(
-                                obs, action_denormed, sim_step)
+                                obs, action, sim_step)
                             sim_step += 1
                             obs['task_description'] = task_description
                             batch, replay_img = self.dataset(obs)

@@ -39,6 +39,39 @@ def _smoothstep(n_steps: int) -> np.ndarray:
     return x * x * (3.0 - 2.0 * x)
 
 
+def interpolate_action_trajectory(actions,
+                                  factor: int,
+                                  arm_action_dim: Optional[int] = None):
+    """Interpolate arm action dimensions while holding non-arm commands."""
+    actions = np.asarray(actions)
+    if actions.ndim != 2 or len(actions) <= 1:
+        return actions
+
+    factor = int(factor)
+    if factor <= 1:
+        return actions
+
+    arm_dim = actions.shape[1] if arm_action_dim is None else arm_action_dim
+    arm_dim = min(int(arm_dim), actions.shape[1])
+    out_len = (len(actions) - 1) * factor + 1
+    interpolated = np.empty((out_len, actions.shape[1]), dtype=actions.dtype)
+
+    out_idx = 0
+    for idx in range(len(actions) - 1):
+        start = actions[idx]
+        end = actions[idx + 1]
+        for step in range(factor):
+            alpha = step / factor
+            interpolated[out_idx, :arm_dim] = (
+                start[:arm_dim] + alpha * (end[:arm_dim] - start[:arm_dim]))
+            if arm_dim < actions.shape[1]:
+                interpolated[out_idx, arm_dim:] = start[arm_dim:]
+            out_idx += 1
+
+    interpolated[-1] = actions[-1]
+    return interpolated
+
+
 def _as_limit(values, dofs: int, default) -> list:
     if values is None:
         if not np.isscalar(default):
