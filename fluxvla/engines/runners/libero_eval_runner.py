@@ -42,6 +42,19 @@ from ..utils.root import RUNNERS
 overwatch = initialize_overwatch(__name__)
 
 
+def resample_remaining(traj, offset):
+    """Linearly interpolate a remaining action trajectory."""
+    n_steps = traj.shape[0]
+    out_steps = n_steps - int(offset)
+    if out_steps <= 0:
+        return traj[:0]
+    idx = np.clip(offset + np.arange(out_steps), 0.0, n_steps - 1.0)
+    lo = np.floor(idx).astype(int)
+    hi = np.minimum(lo + 1, n_steps - 1)
+    alpha = (idx - lo)[:, np.newaxis]
+    return traj[lo] + alpha * (traj[hi] - traj[lo])
+
+
 @RUNNERS.register_module()
 class LiberoEvalRunner:
     """Runner for evaluating models using Hugging Face Transformers.
@@ -87,6 +100,8 @@ class LiberoEvalRunner:
                  mixed_precision_dtype: str = 'bf16',
                  enable_mixed_precision_training: bool = True,
                  metrics: Dict = None,
+                 rtc_config: Dict = None,
+                 execute_horizon: int = None,
                  config_path: str = None):
         from fluxvla.engines import (build_dataset_from_cfg,
                                      build_transform_from_cfg,
@@ -158,6 +173,8 @@ class LiberoEvalRunner:
         self.enable_mixed_precision_training = enable_mixed_precision_training
         self.distributed_state = overwatch.distributed_state
         self.metrics_cfg = metrics
+        self.rtc_config = rtc_config
+        self.execute_horizon = execute_horizon
         self.config_path = config_path
         self.metrics = None
         self._eval_cfg_snapshot = self._extract_eval_cfg_snapshot(cfg)
@@ -221,6 +238,8 @@ class LiberoEvalRunner:
             'binarize_gripper': False,
             'simulator': 'libero',
             'task_suite_name': self.task_suite_name,
+            'execute_horizon': self.execute_horizon,
+            'rtc_config': self.rtc_config,
         }
 
     def _build_metrics_eval_config(self) -> Dict:
@@ -253,6 +272,60 @@ class LiberoEvalRunner:
     def _mark_episode_success(self, success: bool):
         if self.metrics is not None:
             self.metrics.mark_success(success)
+
+    def _get_tensor_device_dtype(self, batch: Dict):
+        if torch.is_tensor(batch.get('states')):
+            return batch['states'].device, batch['states'].dtype
+        for value in batch.values():
+            if torch.is_tensor(value):
+                dtype = value.dtype if value.dtype.is_floating_point else (
+                    self.mixed_precision_dtype)
+                return value.device, dtype
+        return (torch.device(f'cuda:{self.device_id}'),
+                self.mixed_precision_dtype)
+
+    def _rtc_enabled(self):
+        return bool(self.rtc_config and self.rtc_config.get('enabled', False))
+
+    def _apply_rtc_inputs(self, batch: Dict, prev_ctx, sim_step: int):
+        if not self._rtc_enabled():
+            return
+        if prev_ctx is None or getattr(prev_ctx, 'raw_actions', None) is None:
+            return
+        offset = sim_step - getattr(prev_ctx, 'action_sim_step', sim_step)
+        remaining = resample_remaining(prev_ctx.raw_actions[0], offset)
+        if remaining.shape[0] == 0:
+            return
+        prefix_len = self.rtc_config.get('prefix_len')
+        if prefix_len is None:
+            prefix_len = remaining.shape[0]
+        prefix_len = min(int(prefix_len), remaining.shape[0])
+        if prefix_len <= 0:
+            return
+        device, dtype = self._get_tensor_device_dtype(batch)
+        batch['prev_actions'] = torch.from_numpy(remaining[None]).to(
+            device=device, dtype=dtype)
+        batch['prefix_len'] = prefix_len
+        batch['rtc_config'] = self.rtc_config
+
+    def _actions_to_numpy(self, actions):
+        if len(actions.shape) == 3:
+            action_np = actions.float().cpu().numpy()
+            return action_np, action_np[0, :self.eval_chunk_size, :]
+        assert len(actions.shape) == 2, \
+            f'Unexpected action shape: {actions.shape}'
+        action_np = actions.float().cpu().numpy()
+        return action_np[None], action_np[0, None, :]
+
+    def _num_actions_to_execute(self, actions):
+        if self.execute_horizon is None:
+            if self._rtc_enabled():
+                prefix_len = self.rtc_config.get('prefix_len')
+                if prefix_len is not None and int(prefix_len) > 0:
+                    prefix_len = min(int(prefix_len), actions.shape[0] - 1)
+                    return max(actions.shape[0] - prefix_len, 1)
+            return actions.shape[0]
+        return min(max(int(self.execute_horizon), 1), actions.shape[0])
 
     def _sim_joint_pos_from_obs(self, obs: Dict):
         try:
@@ -404,6 +477,7 @@ class LiberoEvalRunner:
                 log_file.write(f'Starting episode {trial_id+1}...\n')
                 metrics_task_id = f'task{task_id:02d}_trial{trial_id:03d}'
                 sim_step = 0
+                prev_ctx = None
                 with self._metrics_episode_ctx(
                         metrics_task_id, task_description,
                         self.num_trials_per_task):
@@ -431,7 +505,9 @@ class LiberoEvalRunner:
                             inference_start=time.time(),
                             inference_elapsed=0.0,
                             raw_actions=None,
+                            action_sim_step=sim_step,
                             t_first_publish=None)
+                        self._apply_rtc_inputs(batch, prev_ctx, sim_step)
                         with torch.autocast(
                                 'cuda',
                                 dtype=self.mixed_precision_dtype,
@@ -442,16 +518,11 @@ class LiberoEvalRunner:
                                     ctx.inference_elapsed = (
                                         time.time() - ctx.inference_start)
                                     ctx.raw_actions = actions
-                        if len(actions.shape) == 3:
-                            actions = actions[
-                                0, :self.eval_chunk_size,
-                                :].float().cpu().numpy()
-                        else:
-                            assert len(actions.shape) == 2, \
-                                f'Unexpected action shape: {actions.shape}'
-                            actions = actions[0, None, :].float().cpu().numpy()
+                        raw_actions, actions = self._actions_to_numpy(actions)
+                        ctx.raw_actions = raw_actions
+                        n_execute = self._num_actions_to_execute(actions)
                         published_actions = 0
-                        for action in actions:
+                        for action in actions[:n_execute]:
                             inputs = dict(
                                 action=action,
                                 task_suite_name=self.task_suite_name,
@@ -473,6 +544,7 @@ class LiberoEvalRunner:
                                 break
                             t += 1
                         self._emit_action_publish(ctx, published_actions)
+                        prev_ctx = ctx
                         if done:
                             break
                     self._mark_episode_success(bool(done))

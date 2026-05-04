@@ -212,6 +212,12 @@ eval = dict(
     resize_size=224,
     num_trials_per_task=50,
     num_steps_wait=10,
+    execute_horizon=None,
+    rtc_config=dict(
+        enabled=False,
+        method='prefix',
+        prefix_len=5,
+    ),
     seed=7,
     dataset=dict(
         type='LiberoParquetEvalDataset',
