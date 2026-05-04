@@ -270,6 +270,18 @@ inference = dict(
     preview_action_count=5,
     interpolate_actions=True,
     action_interpolation_factor=3,
+    trajectory_stitching=dict(
+        enabled=True,
+        horizon=5,
+        gripper_mode='hold_then_switch',
+    ),
+    ruckig_smoothing=dict(
+        enabled=True,
+        max_velocity=[0.4, 0.4, 0.4, 0.6, 0.6, 0.8],
+        max_acceleration=[0.8, 0.8, 0.8, 1.2, 1.2, 1.6],
+        max_jerk=[2.0, 2.0, 2.0, 3.0, 3.0, 4.0],
+        fallback_to_linear=True,
+    ),
     publish_rate=10,
     prepare_pose=None,
     prepare_gripper=None,

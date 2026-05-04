@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from ..utils.trajectory_postprocessor import (RuckigActionSmoother,
+                                              TrajectoryStitcher)
 from ..utils.root import RUNNERS
 from .base_inference_runner import BaseInferenceRunner
 
@@ -102,6 +104,8 @@ class ARXInferenceRunner(BaseInferenceRunner):
                  preview_action_count: int = 5,
                  interpolate_actions: bool = False,
                  action_interpolation_factor: int = 1,
+                 trajectory_stitching: dict = None,
+                 ruckig_smoothing: dict = None,
                  *args,
                  **kwargs):
         legacy_gripper_thr = kwargs.pop('gripper_threshold', None)
@@ -225,6 +229,10 @@ class ARXInferenceRunner(BaseInferenceRunner):
         self.preview_action_count = preview_action_count
         self.interpolate_actions = interpolate_actions
         self.action_interpolation_factor = action_interpolation_factor
+        self.trajectory_stitcher = TrajectoryStitcher(
+            **(trajectory_stitching or {}))
+        self.ruckig_smoother = RuckigActionSmoother(
+            **(ruckig_smoothing or {}))
 
     def get_ros_observation(
         self
@@ -391,8 +399,9 @@ class ARXInferenceRunner(BaseInferenceRunner):
 
     def _execute_actions(self, actions: np.ndarray, rate):
         ctx = self._action_ctx
+        prev = self._prev_ctx
 
-        if self.async_execution and self._prev_ctx is not None:
+        if self.async_execution and prev is not None:
             ctx.action_timestamp = ctx.inference_start
             offset = (time.time() - ctx.action_timestamp) / self.dt
             actions = resample_remaining(actions, offset)
@@ -402,13 +411,43 @@ class ARXInferenceRunner(BaseInferenceRunner):
                 actions = actions[:self.execute_horizon]
 
         publish_dt = self.dt
+        if self.async_execution and prev is not None:
+            prev_actions = getattr(prev, 'executed_actions', None)
+            prev_dt = getattr(prev, 'executed_dt', None)
+            prev_start = getattr(prev, 't_first_publish', None)
+            if prev_start is None:
+                prev_start = getattr(prev, 'action_timestamp', None)
+            elapsed = (None if prev_start is None else time.time() -
+                       float(prev_start))
+            actions = self.trajectory_stitcher.stitch(
+                actions,
+                arm_action_dim=self.arm_action_dim,
+                previous_actions=prev_actions,
+                elapsed_since_previous_start=elapsed,
+                previous_dt=prev_dt)
+
+        ruckig_meta = {'applied': False, 'error': None}
+        if getattr(self.ruckig_smoother, 'enabled', False):
+            actions, ruckig_meta = self.ruckig_smoother.smooth(
+                actions, arm_action_dim=self.arm_action_dim, dt=publish_dt)
+
         interpolation_factor = int(self.action_interpolation_factor)
-        if self.interpolate_actions and interpolation_factor > 1:
+        should_interpolate = (
+            self.interpolate_actions and interpolation_factor > 1 and
+            (not ruckig_meta.get('applied')))
+        if should_interpolate:
             actions = interpolate_action_trajectory(
                 actions, interpolation_factor, self.arm_action_dim)
             publish_dt = self.dt / interpolation_factor
 
+        if (ruckig_meta.get('error') and
+                not self.ruckig_smoother.fallback_to_linear):
+            raise RuntimeError('Ruckig smoothing failed: '
+                               f"{ruckig_meta['error']}")
+
         ctx.t_first_publish = time.time()
+        ctx.executed_actions = np.asarray(actions).copy()
+        ctx.executed_dt = publish_dt
         n_actions_total = int(actions.shape[0]) if actions.ndim >= 1 else 0
         gripper_dim_emit = (1 if (actions.ndim >= 2
                                   and actions.shape[1] > self.arm_action_dim)
