@@ -280,6 +280,8 @@ inference = dict(
         max_velocity=[0.4, 0.4, 0.4, 0.6, 0.6, 0.8],
         max_acceleration=[0.8, 0.8, 0.8, 1.2, 1.2, 1.6],
         max_jerk=[2.0, 2.0, 2.0, 3.0, 3.0, 4.0],
+        control_dt=0.02,
+        resample_to_input_length=True,
         fallback_to_linear=True,
     ),
     publish_rate=10,

@@ -72,6 +72,46 @@ def interpolate_action_trajectory(actions,
     return interpolated
 
 
+def resample_action_trajectory(actions,
+                               target_steps: int,
+                               arm_action_dim: Optional[int] = None):
+    """Resample a trajectory to a fixed step count.
+
+    Arm dimensions are linearly resampled over the full trajectory. Non-arm
+    command dimensions are sampled with nearest/hold behavior so gripper
+    commands are not numerically blended.
+    """
+    actions = np.asarray(actions)
+    target_steps = int(target_steps)
+    if actions.ndim != 2 or target_steps <= 0:
+        return actions
+    if len(actions) == target_steps:
+        return actions
+    if len(actions) == 0:
+        return actions
+    if target_steps == 1:
+        return actions[-1:].copy()
+    if len(actions) == 1:
+        return np.repeat(actions, target_steps, axis=0)
+
+    arm_dim = actions.shape[1] if arm_action_dim is None else arm_action_dim
+    arm_dim = min(int(arm_dim), actions.shape[1])
+    src_idx = np.linspace(0.0, len(actions) - 1.0, target_steps)
+    lo = np.floor(src_idx).astype(int)
+    hi = np.minimum(lo + 1, len(actions) - 1)
+    alpha = (src_idx - lo)[:, np.newaxis]
+
+    out = np.empty((target_steps, actions.shape[1]), dtype=actions.dtype)
+    out[:, :arm_dim] = (
+        (1.0 - alpha) * actions[lo, :arm_dim] +
+        alpha * actions[hi, :arm_dim])
+    if arm_dim < actions.shape[1]:
+        hold_idx = np.rint(src_idx).astype(int)
+        hold_idx = np.clip(hold_idx, 0, len(actions) - 1)
+        out[:, arm_dim:] = actions[hold_idx, arm_dim:]
+    return out
+
+
 def _as_limit(values, dofs: int, default) -> list:
     if values is None:
         if not np.isscalar(default):
@@ -161,6 +201,9 @@ class RuckigActionSmoother:
                  max_jerk=None,
                  fallback_to_linear: bool = True,
                  max_segment_steps: int = 1000,
+                 resample_to_input_length: bool = False,
+                 max_output_steps: int = None,
+                 control_dt: float = None,
                  **kwargs):
         del kwargs
         self.enabled = bool(enabled)
@@ -169,6 +212,9 @@ class RuckigActionSmoother:
         self.max_jerk = max_jerk
         self.fallback_to_linear = bool(fallback_to_linear)
         self.max_segment_steps = int(max_segment_steps)
+        self.resample_to_input_length = bool(resample_to_input_length)
+        self.max_output_steps = max_output_steps
+        self.control_dt = control_dt
         self._last_error = None
 
     @property
@@ -207,11 +253,15 @@ class RuckigActionSmoother:
 
         try:
             arm_dim = min(int(arm_action_dim), actions.shape[1])
+            input_steps = len(actions)
             if arm_dim <= 0:
                 return actions, meta
             max_vel, max_acc, max_jerk = self._limits(arm_dim)
+            ruckig_dt = float(self.control_dt or dt)
+            if ruckig_dt <= 0.0:
+                raise ValueError(f'Invalid Ruckig control_dt: {ruckig_dt}')
 
-            otg = Ruckig(arm_dim, float(dt))
+            otg = Ruckig(arm_dim, ruckig_dt)
             inp = InputParameter(arm_dim)
             out = OutputParameter(arm_dim)
             inp.max_velocity = max_vel
@@ -252,7 +302,27 @@ class RuckigActionSmoother:
 
             smoothed[-1] = actions[-1]
             meta['applied'] = True
-            return np.asarray(smoothed, dtype=actions.dtype), meta
+            meta['control_dt'] = ruckig_dt
+            result_actions = np.asarray(smoothed, dtype=actions.dtype)
+            target_steps = None
+            if self.resample_to_input_length:
+                target_steps = input_steps
+            if self.max_output_steps is not None:
+                max_output_steps = int(self.max_output_steps)
+                if max_output_steps > 0:
+                    target_steps = (max_output_steps if target_steps is None
+                                    else min(target_steps, max_output_steps))
+            if target_steps is not None and target_steps > 0:
+                original_steps = len(result_actions)
+                result_actions = resample_action_trajectory(
+                    result_actions, target_steps, arm_dim)
+                meta['resampled'] = True
+                meta['original_steps'] = int(original_steps)
+                meta['output_steps'] = int(len(result_actions))
+            else:
+                meta['resampled'] = False
+                meta['output_steps'] = int(len(result_actions))
+            return result_actions, meta
         except Exception as exc:
             self._last_error = str(exc)
             meta['error'] = str(exc)
