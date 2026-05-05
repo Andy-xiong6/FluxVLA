@@ -174,11 +174,13 @@ def plot_denoising_per_dim(intermediates,
         dim_names: Optional list of dimension names.
     """
     n_steps = len(intermediates)
-    action_dim = intermediates[0].shape[-1]
+    action_dim = min(intermediates[0].shape[-1], 6)
     T = intermediates[0].shape[1]
 
     if dim_names is None:
         dim_names = [f'dim {d}' for d in range(action_dim)]
+    else:
+        dim_names = dim_names[:action_dim]
 
     # Layout: one row per dimension
     n_cols = 2
@@ -268,7 +270,7 @@ def plot_comparison(results,
         'guidance_vjp': ('m', '--'),
     }
 
-    action_dim = gt_actions.shape[-1]
+    action_dim = min(gt_actions.shape[-1], 6)
     T = gt_actions.shape[1]
 
     n_cols = 2
