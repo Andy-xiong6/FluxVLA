@@ -187,8 +187,9 @@ class BaseInferenceRunner:
         self._inference_cfg_dict: Dict = self._extract_inference_cfg_snapshot(
             kwargs.get('cfg'))
         try:
+            metrics_cfg = self._prepare_metrics_cfg(self.metrics_cfg)
             self.metrics = build_metrics_manager_from_cfg(
-                self.metrics_cfg,
+                metrics_cfg,
                 runtime_meta_provider=self._build_runtime_meta,
                 inference_config_provider=self._build_inference_config,
                 ckpt_path=self.ckpt_path,
@@ -197,6 +198,23 @@ class BaseInferenceRunner:
             overwatch.warning(f'Metrics initialization failed: {e}. '
                               f'Continuing without metrics recording.')
             self.metrics = None
+
+    def _prepare_metrics_cfg(self, metrics_cfg: Optional[Dict]):
+        if metrics_cfg is None:
+            return None
+        cfg = dict(metrics_cfg)
+        save_video = cfg.pop('save_cam_high_video', True)
+        if save_video and 'video_topic' not in cfg:
+            video_topic = getattr(self.ros_operator, 'img_third_topic', None)
+            if video_topic:
+                cfg['video_topic'] = video_topic
+                cfg.setdefault(
+                    'video_msg_type',
+                    getattr(self.ros_operator, 'image_msg_type',
+                            'sensor_msgs.msg:Image'))
+                cfg.setdefault('video_filename', 'cam_high.mp4')
+                cfg.setdefault('video_fps', 30.0)
+        return cfg
 
     def _init_zmq_client(self, cfg: Dict):
         """Initialize ZMQ client for remote inference.

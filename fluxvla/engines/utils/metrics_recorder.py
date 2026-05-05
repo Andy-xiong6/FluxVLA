@@ -34,6 +34,7 @@ JOINTSTATE_FILENAME = 'jointstate.jsonl'
 META_FILENAME = 'meta.json'
 MANIFEST_FILENAME = 'manifest.jsonl'
 SUCCESS_CSV_FILENAME = 'success.csv'
+DEFAULT_VIDEO_FILENAME = 'cam_high.mp4'
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,16 @@ def _safe_git_info(repo_root: str):
     except Exception:
         dirty = None
     return commit, dirty
+
+
+def _import_ros_msg_cls(type_or_cls):
+    if type_or_cls is None:
+        return None
+    if not isinstance(type_or_cls, str):
+        return type_or_cls
+    module_path, cls_name = type_or_cls.split(':')
+    module = importlib.import_module(module_path)
+    return getattr(module, cls_name)
 
 
 def _jsonable(obj: Any) -> Any:
@@ -123,12 +134,6 @@ def _jsonable(obj: Any) -> Any:
     return _convert(obj)
 
 
-def _import_ros_msg_cls(type_path: str):
-    module_path, class_name = type_path.split(':')
-    module = importlib.import_module(module_path)
-    return getattr(module, class_name)
-
-
 # ---------------------------------------------------------------------------
 # EpisodeWriter (plan section 4.3)
 # ---------------------------------------------------------------------------
@@ -142,7 +147,9 @@ class EpisodeWriter:
     def __init__(self, episode_id: str, episode_dir: str, task_id: str,
                  instruction: str, num_times: int,
                  ckpt_path: Optional[str], config_path: Optional[str],
-                 runtime_meta: Dict, inference_config_snapshot: Dict):
+                 runtime_meta: Dict, inference_config_snapshot: Dict,
+                 video_filename: Optional[str] = None,
+                 video_fps: float = 30.0):
         self.episode_id = episode_id
         self.episode_dir = episode_dir
         self.task_id = task_id
@@ -152,10 +159,14 @@ class EpisodeWriter:
         self.config_path = config_path
         self.runtime_meta = dict(runtime_meta or {})
         self.inference_config_snapshot = inference_config_snapshot or {}
+        self.video_filename = video_filename
+        self.video_fps = float(video_fps or 30.0)
 
         self.events_path = os.path.join(episode_dir, EVENTS_FILENAME)
         self.jointstate_path = os.path.join(episode_dir, JOINTSTATE_FILENAME)
         self.meta_path = os.path.join(episode_dir, META_FILENAME)
+        self.video_path = (os.path.join(episode_dir, video_filename)
+                           if video_filename else None)
 
         os.makedirs(episode_dir, exist_ok=True)
         self._events_fp = open(self.events_path, 'a', buffering=1)
@@ -170,6 +181,9 @@ class EpisodeWriter:
         self._repeat_counter = 0
         self._end_iso: Optional[str] = None
         self._duration_s: Optional[float] = None
+        self._video_writer = None
+        self._video_frame_size = None
+        self._n_video_frames = 0
 
     def next_repeat_idx(self) -> int:
         self._repeat_counter += 1
@@ -285,6 +299,9 @@ class EpisodeWriter:
             'n_actions_published': self._n_actions_published,
             'reason': reason,
         }
+        if self.video_path is not None:
+            payload['video_path'] = os.path.basename(self.video_path)
+            payload['n_video_frames'] = self._n_video_frames
         self._write_event_line(payload)
         self._flush_meta()
         summary = {
@@ -303,7 +320,39 @@ class EpisodeWriter:
             'meta_path': f'{self.episode_id}/{META_FILENAME}',
             'reason': reason,
         }
+        if self.video_path is not None:
+            summary['video_path'] = f'{self.episode_id}/{self.video_filename}'
+            summary['n_video_frames'] = self._n_video_frames
         return summary
+
+    def write_video_frame(self, frame):
+        if self.video_path is None:
+            return
+        import cv2
+        import numpy as np
+
+        frame = np.asarray(frame)
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.ndim == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            return
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+        height, width = frame.shape[:2]
+        frame_size = (int(width), int(height))
+        with self._lock:
+            if self._video_writer is None:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                self._video_writer = cv2.VideoWriter(
+                    self.video_path, fourcc, self.video_fps, frame_size)
+                self._video_frame_size = frame_size
+            if frame_size != self._video_frame_size:
+                frame = cv2.resize(frame, self._video_frame_size)
+            self._video_writer.write(frame)
+            self._n_video_frames += 1
 
     def write_jointstate(self, msg):
         try:
@@ -353,6 +402,13 @@ class EpisodeWriter:
             'config_path': self.config_path,
             'inference_config_snapshot': self.inference_config_snapshot,
             'runtime': self.runtime_meta,
+            'video': {
+                'path': os.path.basename(self.video_path)
+                if self.video_path else None,
+                'fps': self.video_fps if self.video_path else None,
+                'n_frames': self._n_video_frames
+                if self.video_path else None,
+            },
             'host': {
                 'hostname': socket.gethostname(),
                 'pid': os.getpid(),
@@ -371,6 +427,12 @@ class EpisodeWriter:
 
     def close(self):
         with self._lock:
+            try:
+                if self._video_writer is not None:
+                    self._video_writer.release()
+                    self._video_writer = None
+            except Exception:
+                pass
             try:
                 self._events_fp.close()
             except Exception:
@@ -397,6 +459,11 @@ class MetricsManager:
                  joint_state_msg_type: str,
                  enabled: bool = True,
                  subscribe_queue_size: int = 200,
+                 video_topic: Optional[str] = None,
+                 video_msg_type: Optional[str] = None,
+                 video_filename: str = DEFAULT_VIDEO_FILENAME,
+                 video_fps: float = 30.0,
+                 video_queue_size: int = 30,
                  runtime_meta_provider: Optional[Callable[[], Dict]] = None,
                  inference_config_provider:
                  Optional[Callable[[], Dict]] = None,
@@ -407,6 +474,11 @@ class MetricsManager:
         self.joint_state_msg_type = joint_state_msg_type
         self.enabled = enabled
         self.subscribe_queue_size = subscribe_queue_size
+        self.video_topic = video_topic
+        self.video_msg_type = video_msg_type or 'sensor_msgs.msg:Image'
+        self.video_filename = video_filename
+        self.video_fps = float(video_fps or 30.0)
+        self.video_queue_size = int(video_queue_size)
         self.runtime_meta_provider = (runtime_meta_provider
                                       if runtime_meta_provider is not None
                                       else lambda: {})
@@ -420,6 +492,8 @@ class MetricsManager:
         self._active_lock = threading.Lock()
         self._episode_counters: Dict[str, int] = {}
         self._subscriber = None
+        self._video_subscriber = None
+        self._cv_bridge = None
         self._manifest_path = os.path.join(self.output_root,
                                            MANIFEST_FILENAME)
         self._manifest_lock = threading.Lock()
@@ -440,6 +514,22 @@ class MetricsManager:
         overwatch.info(
             f'MetricsManager subscribed to {self.joint_state_topic} '
             f'(msg_type={self.joint_state_msg_type})')
+        if self.video_topic:
+            try:
+                from cv_bridge import CvBridge
+                self._cv_bridge = CvBridge()
+                video_msg_cls = _import_ros_msg_cls(self.video_msg_type)
+                self._video_subscriber = rospy.Subscriber(
+                    self.video_topic,
+                    video_msg_cls,
+                    self._on_video_image,
+                    queue_size=self.video_queue_size,
+                    tcp_nodelay=True)
+                overwatch.info(
+                    f'MetricsManager recording video from {self.video_topic} '
+                    f'to {self.video_filename}')
+            except Exception as e:
+                overwatch.warning(f'Failed to initialize video recording: {e}')
 
     def _init_manifest_if_missing(self):
         if not os.path.exists(self._manifest_path):
@@ -458,6 +548,17 @@ class MetricsManager:
             writer.write_jointstate(msg)
         except Exception as e:
             overwatch.warning(f'Failed to write jointstate: {e}')
+
+    def _on_video_image(self, msg):
+        with self._active_lock:
+            writer = self._active_writer
+        if writer is None or self._cv_bridge is None:
+            return
+        try:
+            frame = self._cv_bridge.imgmsg_to_cv2(msg, 'bgr8')
+            writer.write_video_frame(frame)
+        except Exception as e:
+            overwatch.warning(f'Failed to write video frame: {e}')
 
     def start_episode(self, task_id: str, instruction: str,
                       num_times: int) -> EpisodeWriter:
@@ -485,7 +586,9 @@ class MetricsManager:
             ckpt_path=self.ckpt_path,
             config_path=self.config_path,
             runtime_meta=runtime_meta,
-            inference_config_snapshot=inference_cfg)
+            inference_config_snapshot=inference_cfg,
+            video_filename=self.video_filename if self.video_topic else None,
+            video_fps=self.video_fps)
         writer.write_event_episode_start(
             publish_rate=runtime_meta.get('publish_rate'),
             action_chunk=runtime_meta.get('action_chunk'),
@@ -573,6 +676,12 @@ class MetricsManager:
                 self._subscriber = None
         except Exception:
             pass
+        try:
+            if self._video_subscriber is not None:
+                self._video_subscriber.unregister()
+                self._video_subscriber = None
+        except Exception:
+            pass
         with self._active_lock:
             writer = self._active_writer
             self._active_writer = None
@@ -603,6 +712,11 @@ def build_metrics_manager_from_cfg(
         joint_state_msg_type=cfg['joint_state_msg_type'],
         enabled=True,
         subscribe_queue_size=cfg.get('subscribe_queue_size', 200),
+        video_topic=cfg.get('video_topic'),
+        video_msg_type=cfg.get('video_msg_type', 'sensor_msgs.msg:Image'),
+        video_filename=cfg.get('video_filename', DEFAULT_VIDEO_FILENAME),
+        video_fps=cfg.get('video_fps', 30.0),
+        video_queue_size=cfg.get('video_queue_size', 30),
         runtime_meta_provider=runtime_meta_provider,
         inference_config_provider=inference_config_provider,
         ckpt_path=ckpt_path,

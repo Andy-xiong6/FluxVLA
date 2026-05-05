@@ -128,6 +128,7 @@ class ARXROSOperator:
         self.joint_command_topic = joint_command_topic
         self.gripper_command_topic = gripper_command_topic
         self.pose_command_topic = pose_command_topic
+        self.image_msg_type = image_msg_type
         self.joint_state_field = joint_state_field
         self.gripper_state_field = gripper_state_field
         self.joint_command_field = joint_command_field
