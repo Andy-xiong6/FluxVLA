@@ -116,17 +116,18 @@ def _as_limit(values, dofs: int, default) -> list:
     if values is None:
         if not np.isscalar(default):
             default = list(default)
-            if len(default) != dofs:
-                raise ValueError(
-                    f'Expected {dofs} default values, got {len(default)}')
-            return [float(v) for v in default]
+            if len(default) < dofs:
+                default = default + [default[-1]] * (dofs - len(default))
+            return [float(v) for v in default[:dofs]]
         return [float(default)] * dofs
     if np.isscalar(values):
         return [float(values)] * dofs
     values = list(values)
-    if len(values) != dofs:
-        raise ValueError(f'Expected {dofs} limit values, got {len(values)}')
-    return [float(v) for v in values]
+    if len(values) == 0:
+        raise ValueError('Limit list must not be empty')
+    if len(values) < dofs:
+        values = values + [values[-1]] * (dofs - len(values))
+    return [float(v) for v in values[:dofs]]
 
 
 class TrajectoryStitcher:
