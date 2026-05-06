@@ -48,6 +48,8 @@ def parse_args():
     parser.add_argument('--savgol-window', type=int, default=21)
     parser.add_argument('--savgol-polyorder', type=int, default=3)
     parser.add_argument('--fft-cutoff-ratio', type=float, default=0.2)
+    parser.add_argument('--jitter-cutoff-hz', type=float, default=10.0,
+                        help='Fixed cutoff for joint-wise jitter FFT.')
     parser.add_argument('--control-freq-hz', type=float, default=None,
                         help='Override control freq; default reads manifest.')
     parser.add_argument('--update-manifest', action='store_true')
@@ -352,7 +354,12 @@ def compute_smoothness_metrics(jointstate_df: pd.DataFrame,
             'avg_acc_norm': None,
             'avg_jerk_norm': None,
             'max_jerk_norm': None,
+            'joint_jerk_rms_mean': None,
+            'joint_jerk_rms_max': None,
+            'joint_jerk_isj_mean': None,
+            'joint_jerk_isj_max': None,
             'jerk_norm_series': None,
+            'joint_jerk_series': None,
             'jerk_dt_mean': None,
         }
     t = jointstate_df['t_ros'].fillna(jointstate_df['t_wall']).to_numpy(
@@ -368,7 +375,12 @@ def compute_smoothness_metrics(jointstate_df: pd.DataFrame,
             'avg_acc_norm': None,
             'avg_jerk_norm': None,
             'max_jerk_norm': None,
+            'joint_jerk_rms_mean': None,
+            'joint_jerk_rms_max': None,
+            'joint_jerk_isj_mean': None,
+            'joint_jerk_isj_max': None,
             'jerk_norm_series': None,
+            'joint_jerk_series': None,
             'jerk_dt_mean': None,
         }
     if vel.ndim == 1:
@@ -379,7 +391,12 @@ def compute_smoothness_metrics(jointstate_df: pd.DataFrame,
             'avg_acc_norm': None,
             'avg_jerk_norm': None,
             'max_jerk_norm': None,
+            'joint_jerk_rms_mean': None,
+            'joint_jerk_rms_max': None,
+            'joint_jerk_isj_mean': None,
+            'joint_jerk_isj_max': None,
             'jerk_norm_series': None,
+            'joint_jerk_series': None,
             'jerk_dt_mean': None,
         }
     diffs = np.diff(t)
@@ -391,7 +408,12 @@ def compute_smoothness_metrics(jointstate_df: pd.DataFrame,
             'avg_acc_norm': None,
             'avg_jerk_norm': None,
             'max_jerk_norm': None,
+            'joint_jerk_rms_mean': None,
+            'joint_jerk_rms_max': None,
+            'joint_jerk_isj_mean': None,
+            'joint_jerk_isj_max': None,
             'jerk_norm_series': None,
+            'joint_jerk_series': None,
             'jerk_dt_mean': None,
         }
     vel_filt = filter_signal(vel, fs_hz, filter_mode,
@@ -402,13 +424,24 @@ def compute_smoothness_metrics(jointstate_df: pd.DataFrame,
     jerk = compute_jerk_central(vel_filt, dt_mean)
     acc_norm = _vec_l2_norm(acc)
     jerk_norm = _vec_l2_norm(jerk)
+    if jerk.ndim == 1:
+        joint_jerk = jerk.reshape(-1, 1)
+    else:
+        joint_jerk = jerk
+    joint_jerk_rms = np.sqrt(np.mean(joint_jerk ** 2, axis=0))
+    joint_jerk_isj = np.sum(joint_jerk ** 2, axis=0) * dt_mean
     return {
         'fs_hz_estimate': fs_hz,
         'avg_acc_norm': float(np.mean(acc_norm)) if acc_norm.size else None,
         'avg_jerk_norm': (float(np.mean(jerk_norm))
                           if jerk_norm.size else None),
         'max_jerk_norm': float(np.max(jerk_norm)) if jerk_norm.size else None,
+        'joint_jerk_rms_mean': float(np.mean(joint_jerk_rms)),
+        'joint_jerk_rms_max': float(np.max(joint_jerk_rms)),
+        'joint_jerk_isj_mean': float(np.mean(joint_jerk_isj)),
+        'joint_jerk_isj_max': float(np.max(joint_jerk_isj)),
         'jerk_norm_series': jerk_norm,
+        'joint_jerk_series': joint_jerk,
         'jerk_dt_mean': dt_mean,
     }
 
@@ -445,6 +478,71 @@ def compute_jitter_fft(jerk_norm_series: Optional[np.ndarray],
     }
 
 
+def _rfft_energy_weights(n_freq: int, n_signal: int) -> np.ndarray:
+    weights = np.ones(n_freq, dtype=float)
+    if n_freq > 2:
+        if n_signal % 2 == 0:
+            weights[1:-1] = 2.0
+        else:
+            weights[1:] = 2.0
+    return weights
+
+
+def compute_joint_jitter_fft(joint_jerk_series: Optional[np.ndarray],
+                             fs_hz: Optional[float],
+                             cutoff_hz: float) -> Dict:
+    if (joint_jerk_series is None or joint_jerk_series.shape[0] < 8
+            or fs_hz is None or fs_hz <= 0 or cutoff_hz is None
+            or cutoff_hz <= 0):
+        return {
+            'joint_jitter_high_freq_rms_mean': None,
+            'joint_jitter_high_freq_rms_max': None,
+            'joint_jitter_high_freq_ratio_mean': None,
+            'joint_jitter_high_freq_ratio_max': None,
+            'joint_jitter_cutoff_hz': cutoff_hz,
+            'joint_jitter_n_joints': None,
+        }
+    arr = np.asarray(joint_jerk_series, dtype=float)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    arr = arr - np.mean(arr, axis=0, keepdims=True)
+    n = arr.shape[0]
+    window = np.hanning(n).reshape(-1, 1)
+    window_energy = float(np.sum(window[:, 0] ** 2))
+    if window_energy <= 0:
+        return {
+            'joint_jitter_high_freq_rms_mean': None,
+            'joint_jitter_high_freq_rms_max': None,
+            'joint_jitter_high_freq_ratio_mean': None,
+            'joint_jitter_high_freq_ratio_max': None,
+            'joint_jitter_cutoff_hz': cutoff_hz,
+            'joint_jitter_n_joints': int(arr.shape[1]),
+        }
+    spectrum = np.fft.rfft(arr * window, axis=0)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs_hz)
+    weights = _rfft_energy_weights(freqs.shape[0], n).reshape(-1, 1)
+    power = (np.abs(spectrum) ** 2) * weights / window_energy
+    total_per_joint = np.sum(power, axis=0)
+    high_mask = freqs > cutoff_hz
+    high_per_joint = np.sum(power[high_mask], axis=0)
+    ratios = np.divide(
+        high_per_joint, total_per_joint,
+        out=np.full_like(high_per_joint, np.nan, dtype=float),
+        where=total_per_joint > 0)
+    high_rms = np.sqrt(high_per_joint)
+    valid_ratios = ratios[np.isfinite(ratios)]
+    return {
+        'joint_jitter_high_freq_rms_mean': float(np.mean(high_rms)),
+        'joint_jitter_high_freq_rms_max': float(np.max(high_rms)),
+        'joint_jitter_high_freq_ratio_mean': (
+            float(np.mean(valid_ratios)) if valid_ratios.size else None),
+        'joint_jitter_high_freq_ratio_max': (
+            float(np.max(valid_ratios)) if valid_ratios.size else None),
+        'joint_jitter_cutoff_hz': cutoff_hz,
+        'joint_jitter_n_joints': int(arr.shape[1]),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
@@ -452,7 +550,8 @@ def aggregate_episode(episode_dir: str, success: Optional[bool],
                       control_freq_override: Optional[float],
                       filter_mode: str, filter_cutoff_hz: float,
                       savgol_window: int, savgol_polyorder: int,
-                      fft_cutoff_ratio: float) -> Dict:
+                      fft_cutoff_ratio: float,
+                      jitter_cutoff_hz: float) -> Dict:
     episode_id = os.path.basename(episode_dir.rstrip('/'))
     events = load_episode_events(episode_dir)
     events_split = split_events(events)
@@ -476,6 +575,10 @@ def aggregate_episode(episode_dir: str, success: Optional[bool],
     jitter = compute_jitter_fft(smooth.get('jerk_norm_series'),
                                 smooth.get('fs_hz_estimate'),
                                 fft_cutoff_ratio, control_freq_hz)
+    joint_jitter = compute_joint_jitter_fft(
+        smooth.get('joint_jerk_series'),
+        smooth.get('fs_hz_estimate'),
+        jitter_cutoff_hz)
 
     out = {
         'episode_id': episode_id,
@@ -488,13 +591,22 @@ def aggregate_episode(episode_dir: str, success: Optional[bool],
     }
     out.update(rt)
     for k in ('avg_acc_norm', 'avg_jerk_norm', 'max_jerk_norm',
+              'joint_jerk_rms_mean', 'joint_jerk_rms_max',
+              'joint_jerk_isj_mean', 'joint_jerk_isj_max',
               'fs_hz_estimate'):
         out[k] = smooth.get(k)
     for k in ('fft_high_freq_energy', 'fft_total_energy',
               'fft_normalized_high_freq_energy', 'fft_f_c_hz'):
         out[k] = jitter.get(k)
+    for k in ('joint_jitter_high_freq_rms_mean',
+              'joint_jitter_high_freq_rms_max',
+              'joint_jitter_high_freq_ratio_mean',
+              'joint_jitter_high_freq_ratio_max',
+              'joint_jitter_cutoff_hz', 'joint_jitter_n_joints'):
+        out[k] = joint_jitter.get(k)
 
     out['_jerk_norm_series'] = smooth.get('jerk_norm_series')
+    out['_joint_jerk_series'] = smooth.get('joint_jerk_series')
     out['_jerk_dt_mean'] = smooth.get('jerk_dt_mean')
     out['_jointstate_df'] = js_df
     out['_latency_ms_list'] = [
@@ -510,7 +622,13 @@ def aggregate_overall(per_episode: List[Dict]) -> Dict:
         'mean_inference_elapsed_ms', 'realtime_ratio_R',
         'first_action_response_s', 'completion_time_s',
         'publish_freq_actual_hz', 'avg_acc_norm', 'avg_jerk_norm',
-        'max_jerk_norm', 'fft_normalized_high_freq_energy',
+        'max_jerk_norm', 'joint_jerk_rms_mean', 'joint_jerk_rms_max',
+        'joint_jerk_isj_mean', 'joint_jerk_isj_max',
+        'fft_normalized_high_freq_energy',
+        'joint_jitter_high_freq_rms_mean',
+        'joint_jitter_high_freq_rms_max',
+        'joint_jitter_high_freq_ratio_mean',
+        'joint_jitter_high_freq_ratio_max',
     ]
     overall: Dict = {}
     for k in keys:
@@ -550,6 +668,13 @@ PER_EP_COLUMNS = [
     'publish_freq_actual_hz', 'fs_hz_estimate', 'avg_acc_norm',
     'avg_jerk_norm', 'max_jerk_norm', 'fft_normalized_high_freq_energy',
     'fft_high_freq_energy', 'fft_total_energy', 'fft_f_c_hz',
+    'joint_jerk_rms_mean', 'joint_jerk_rms_max',
+    'joint_jerk_isj_mean', 'joint_jerk_isj_max',
+    'joint_jitter_high_freq_rms_mean',
+    'joint_jitter_high_freq_rms_max',
+    'joint_jitter_high_freq_ratio_mean',
+    'joint_jitter_high_freq_ratio_max',
+    'joint_jitter_cutoff_hz', 'joint_jitter_n_joints',
 ]
 
 
@@ -592,7 +717,13 @@ def write_summary_markdown(overall: Dict, per_episode: List[Dict],
             'realtime_ratio_R', 'first_action_response_s',
             'completion_time_s', 'publish_freq_actual_hz', 'avg_acc_norm',
             'avg_jerk_norm', 'max_jerk_norm',
-            'fft_normalized_high_freq_energy']:
+            'joint_jerk_rms_mean', 'joint_jerk_rms_max',
+            'joint_jerk_isj_mean', 'joint_jerk_isj_max',
+            'fft_normalized_high_freq_energy',
+            'joint_jitter_high_freq_rms_mean',
+            'joint_jitter_high_freq_rms_max',
+            'joint_jitter_high_freq_ratio_mean',
+            'joint_jitter_high_freq_ratio_max']:
         s = overall.get(k, {})
         lines.append(f'| {k} | {_fmt(s.get("mean"))} | {_fmt(s.get("std"))} '
                      f'| {_fmt(s.get("p95"))} | {_fmt(s.get("p99"))} '
@@ -603,7 +734,9 @@ def write_summary_markdown(overall: Dict, per_episode: List[Dict],
     head_cols = ['episode_id', 'task_id', 'success', 'mean_latency_ms',
                  'p95_latency_ms', 'p99_latency_ms', 'realtime_ratio_R',
                  'first_action_response_s', 'completion_time_s',
-                 'avg_jerk_norm', 'fft_normalized_high_freq_energy']
+                 'avg_jerk_norm', 'joint_jerk_rms_mean',
+                 'joint_jerk_isj_mean', 'joint_jitter_high_freq_rms_mean',
+                 'joint_jitter_high_freq_ratio_mean']
     lines.append('| ' + ' | '.join(head_cols) + ' |')
     lines.append('|' + '|'.join(['---'] * len(head_cols)) + '|')
     for ep in per_episode:
@@ -669,17 +802,20 @@ def plot_jerk_timeseries(per_episode: List[Dict], output_dir: str):
 def plot_fft_spectrum(per_episode: List[Dict], output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
     for ep in per_episode:
-        series = ep.get('_jerk_norm_series')
+        series = ep.get('_joint_jerk_series')
         fs = ep.get('fs_hz_estimate')
-        fc = ep.get('fft_f_c_hz')
-        if series is None or series.size < 8 or fs is None or fs <= 0:
+        fc = ep.get('joint_jitter_cutoff_hz')
+        if series is None or series.shape[0] < 8 or fs is None or fs <= 0:
             continue
         episode_id = ep.get('episode_id', 'unknown')
-        arr = series - np.mean(series)
-        window = np.hanning(arr.size)
-        spec = np.fft.rfft(arr * window)
-        freqs = np.fft.rfftfreq(arr.size, d=1.0 / fs)
-        power = np.abs(spec) ** 2
+        arr = np.asarray(series, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        arr = arr - np.mean(arr, axis=0, keepdims=True)
+        window = np.hanning(arr.shape[0]).reshape(-1, 1)
+        spec = np.fft.rfft(arr * window, axis=0)
+        freqs = np.fft.rfftfreq(arr.shape[0], d=1.0 / fs)
+        power = np.mean(np.abs(spec) ** 2, axis=1)
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.semilogy(freqs, power + 1e-12)
         if fc is not None:
@@ -687,8 +823,8 @@ def plot_fft_spectrum(per_episode: List[Dict], output_dir: str):
                        label=f'f_c={fc:.2f}Hz')
             ax.legend()
         ax.set_xlabel('Frequency (Hz)')
-        ax.set_ylabel('Power (log)')
-        ax.set_title(f'{episode_id}: jerk FFT')
+        ax.set_ylabel('Mean joint jerk power (log)')
+        ax.set_title(f'{episode_id}: joint jerk FFT')
         fig.tight_layout()
         fig.savefig(os.path.join(output_dir,
                                  f'{episode_id}__fft.png'), dpi=120)
@@ -752,7 +888,8 @@ def main(args):
                 filter_cutoff_hz=args.filter_cutoff_hz,
                 savgol_window=args.savgol_window,
                 savgol_polyorder=args.savgol_polyorder,
-                fft_cutoff_ratio=args.fft_cutoff_ratio)
+                fft_cutoff_ratio=args.fft_cutoff_ratio,
+                jitter_cutoff_hz=args.jitter_cutoff_hz)
         except Exception as e:
             print(f'[WARN] aggregate_episode({episode_id}) failed: {e}')
             continue
