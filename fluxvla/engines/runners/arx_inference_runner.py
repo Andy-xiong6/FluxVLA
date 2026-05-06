@@ -233,6 +233,7 @@ class ARXInferenceRunner(BaseInferenceRunner):
             **(trajectory_stitching or {}))
         self.ruckig_smoother = RuckigActionSmoother(
             **(ruckig_smoothing or {}))
+        self._last_observed_action = None
 
     def get_ros_observation(
         self
@@ -292,6 +293,7 @@ class ARXInferenceRunner(BaseInferenceRunner):
         gripper = self.ros_operator.get_gripper_position(gripper_state)
         gripper = np.asarray([gripper], dtype=np.float32).reshape(-1)
         qpos = np.concatenate([arm_joints, gripper], axis=0)
+        self._last_observed_action = qpos.copy()
 
         observation = {
             'qpos': qpos,
@@ -397,34 +399,82 @@ class ARXInferenceRunner(BaseInferenceRunner):
                 actions[:, gripper_idx] = out
         return actions
 
+    def _coerce_action_anchor(self, anchor, actions):
+        if anchor is None or actions.ndim != 2 or len(actions) == 0:
+            return None
+        anchor = np.asarray(anchor, dtype=actions.dtype).reshape(-1)
+        if anchor.size == actions.shape[1]:
+            return anchor
+        if anchor.size < actions.shape[1]:
+            padded = actions[0].copy()
+            padded[:anchor.size] = anchor
+            return padded
+        return anchor[:actions.shape[1]]
+
+    def _estimate_current_action_anchor(self, actions, prev, now):
+        if actions.ndim != 2 or len(actions) == 0:
+            return None
+
+        if prev is not None:
+            prev_actions = getattr(prev, 'executed_actions', None)
+            prev_dt = getattr(prev, 'executed_dt', None)
+            prev_start = getattr(prev, 't_first_publish', None)
+            if prev_start is None:
+                prev_start = getattr(prev, 'action_timestamp', None)
+            if (prev_actions is not None and prev_dt is not None
+                    and prev_start is not None and float(prev_dt) > 0.0):
+                prev_actions = np.asarray(prev_actions)
+                if prev_actions.ndim == 2 and len(prev_actions) > 0:
+                    elapsed = max(0.0, now - float(prev_start))
+                    offset = elapsed / float(prev_dt)
+                    remaining = resample_remaining(prev_actions, offset)
+                    if len(remaining) > 0:
+                        return self._coerce_action_anchor(remaining[0],
+                                                          actions)
+                    return self._coerce_action_anchor(prev_actions[-1],
+                                                      actions)
+
+        return self._coerce_action_anchor(self._last_observed_action, actions)
+
+    def _prepend_anchor_if_needed(self, actions, anchor):
+        if anchor is None or actions.ndim != 2 or len(actions) == 0:
+            return actions, False
+        arm_dim = min(int(self.arm_action_dim), actions.shape[1])
+        if np.allclose(actions[0, :arm_dim], anchor[:arm_dim], atol=1e-6):
+            return actions, False
+        return np.concatenate([anchor[None], actions], axis=0), True
+
     def _execute_actions(self, actions: np.ndarray, rate):
         ctx = self._action_ctx
         prev = self._prev_ctx
+        now = time.time()
 
         if self.async_execution and prev is not None:
             ctx.action_timestamp = ctx.inference_start
-            offset = (time.time() - ctx.action_timestamp) / self.dt
+            offset = (now - ctx.action_timestamp) / self.dt
             actions = resample_remaining(actions, offset)
         else:
-            ctx.action_timestamp = time.time()
+            ctx.action_timestamp = now
             if self.execute_horizon is not None:
                 actions = actions[:self.execute_horizon]
 
         publish_dt = self.dt
+        anchor = self._estimate_current_action_anchor(actions, prev, now)
+        drop_anchor = False
         if self.async_execution and prev is not None:
             prev_actions = getattr(prev, 'executed_actions', None)
             prev_dt = getattr(prev, 'executed_dt', None)
             prev_start = getattr(prev, 't_first_publish', None)
             if prev_start is None:
                 prev_start = getattr(prev, 'action_timestamp', None)
-            elapsed = (None if prev_start is None else time.time() -
-                       float(prev_start))
+            elapsed = (None if prev_start is None else now - float(prev_start))
             actions = self.trajectory_stitcher.stitch(
                 actions,
                 arm_action_dim=self.arm_action_dim,
                 previous_actions=prev_actions,
                 elapsed_since_previous_start=elapsed,
                 previous_dt=prev_dt)
+        actions, drop_anchor = self._prepend_anchor_if_needed(actions, anchor)
 
         ruckig_meta = {'applied': False, 'error': None}
         if getattr(self.ruckig_smoother, 'enabled', False):
@@ -444,6 +494,9 @@ class ARXInferenceRunner(BaseInferenceRunner):
                 not self.ruckig_smoother.fallback_to_linear):
             raise RuntimeError('Ruckig smoothing failed: '
                                f"{ruckig_meta['error']}")
+
+        if drop_anchor and len(actions) > 1:
+            actions = actions[1:]
 
         ctx.t_first_publish = time.time()
         ctx.executed_actions = np.asarray(actions).copy()
